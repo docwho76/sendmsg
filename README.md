@@ -36,20 +36,18 @@ It supports individual direct messages, Signal group broadcasts, file attachment
 │  │ --signal     │        │ --sms                    │   │
 │  │              │        │                          │   │
 │  │  POST to     │        │  Call `imsg send` CLI    │   │
-│  │  Signal REST │        │  (macOS Messages)        │   │
+│  │  Signal REST │        │                          │   │
 │  │  API         │        │                          │   │
-│  └──────┬───────┘        └──────────┬───────────────┘   │
-│         │                           │                   │
-│         ▼                           ▼                   │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │  signal-cli-rest-api  (Docker)                   │   │
-│  │  http://localhost:8080 (or SIGNAL_REST_URL)      │   │
-│  └──────────────────────────────────────────────────┘   │
+│  └──────┬───────┘        └────────────┬─────────────┘   │
+│         │                             │                 │
+│         ▼                             │                 │
+│      (Docker)                         ▼                 │
+│  ┌───────────────────────┐  ┌─────────────────────┐     │
+│  │ signal-cli-rest-api   │  │                     │     │
+│  │ http://localhost:8080 │  │   macOS Messages    │     │
+│  │ (or SIGNAL_REST_URL)  │  │                     │     │
+│  └───────────────────────┘  └─────────────────────┘     │
 │                                                         │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │  Docker Container                                │   │
-│  │  signal-cli-rest-api				              │   │
-│  └──────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────┘
 ```
 
