@@ -1,3 +1,28 @@
+MacOS garbage to ignore
+# Folder view configuration files
+.DS_Store
+.localized
+
+# Thumbnail cache files
+._*
+
+# Files that might appear on external disks / network shares
+.Spotlight-V100
+.Trashes
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Directory metadata
+__MACOSX/
+.AppleDouble
+.LSOverride
+
+# Icon files
+Icon[]
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
