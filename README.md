@@ -4,7 +4,7 @@
 
 `sendmsg` is a command-line tool for sending messages via the [Signal REST API](https://github.com/bbernhard/signal-cli-rest-api) or locally via macOS [Messages](https://apps.apple.com/app/messages/id1092291483) (iMessage/SMS) through the [`imsg`] CLI.
 
-It supports individual direct messages, Signal group broadcasts, file attachments, and bulk sending from CSV files — all with a single, consistent interface.
+It supports individual direct messages, Signal group broadcasts, file attachments, Signal voice messages, and bulk sending from CSV files — all with a single, consistent interface.
 
 ---
 
@@ -15,6 +15,7 @@ It supports individual direct messages, Signal group broadcasts, file attachment
 - [Installation](#installation)
 - [Usage](#usage)
   * [Signal Messages](#signal-messages)
+  * [Voice Messages](#voice-messages)
   * [SMS / iMessage](#sms--imessage)
   * [Bulk Send from CSV](#bulk-send-from-csv)
   * [Management Commands](#management-commands)
@@ -23,6 +24,7 @@ It supports individual direct messages, Signal group broadcasts, file attachment
 - [Examples](#examples)
 - [Error Handling](#error-handling)
 - [Summary Output](#summary-output)
+- [Changelog](#changelog)
 
 ---
 
@@ -53,7 +55,7 @@ It supports individual direct messages, Signal group broadcasts, file attachment
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Signal path:** `sendmsg` → JSON HTTP POST → `signal-cli-rest-api` → Docker container → Signal network. Attachments are base64-encoded inline in the JSON request body (the API does not accept multipart uploads).
+**Signal path:** `sendmsg` → JSON HTTP POST → `signal-cli-rest-api` → Docker container → Signal network. Attachments are base64-encoded inline in the JSON request body (the API does not accept multipart uploads). Voice messages are sent the same way with the API's `voice` flag set so they render as playable voice notes.
 
 **SMS/iMessage path:** `sendmsg` → subprocess call → `imsg` CLI → macOS Messages framework → carrier/Apple.
 
@@ -63,31 +65,32 @@ It supports individual direct messages, Signal group broadcasts, file attachment
 
 ### Required
 
-| Dependency | Version           | Purpose                           |
-| ---------- | ----------------- | --------------------------------- |
-| Python 3   | 3.9+              | Script runtime                    |
-| macOS 12+  | Monterey or later | Required for iMessage/SMS support |
+| Dependency | Version | Purpose        |
+| ---------- | ------- | -------------- |
+| Python 3   | 3.9+    | Script runtime |
 
 > `sendmsg` uses only the Python standard library — no third-party packages to install.
 
 ### Signal (optional — only needed for `--signal`)
 
-| Dependency                   | Version                       | Purpose                        |
-| ---------------------------- | ----------------------------- | ------------------------------ |
-| Docker                       | 24+                           | Container runtime              |
-| `signal-cli-rest-api`        | latest                        | Signal REST API server         |
-| `signal-cli` (via container) | latest                        | Signal protocol implementation |
+| Dependency                   | Version | Purpose                        |
+| ---------------------------- | ------- | ------------------------------ |
+| Docker                       | 24+     | Container runtime              |
+| `signal-cli-rest-api`        | latest  | Signal REST API server         |
+| `signal-cli` (via container) | latest  | Signal protocol implementation |
+
+> Signal sends only need network access to the REST API endpoint — they do
+> not require macOS.
 
 ### SMS/iMessage (optional — only needed for `--sms`)
 
-| Dependency | Version | Purpose                     |
-| ---------- | ------- | --------------------------- |
-| `imsg` CLI | latest  | macOS Messages / SMS bridge |
+| Dependency | Version           | Purpose                     |
+| ---------- | ----------------- | --------------------------- |
+| macOS 12+  | Monterey or later | Native Messages app         |
+| `imsg` CLI | latest            | macOS Messages / SMS bridge |
 
-### System
-
-- **macOS** — The script is designed for macOS; SMS/iMessage uses the native Messages app.
-- **Network access** — Required to reach the Signal REST API endpoint.
+> SMS/iMessage uses the native macOS Messages app, so macOS 12+ is required
+> for the `--sms` path only.
 
 ---
 
@@ -158,31 +161,68 @@ sendmsg --signal --to +18885551212 --text "Line 1" --text "Line 2"
 
 # Send multiple attachments
 sendmsg --signal --to +18885551212 --text "Files" --attach ~/doc.pdf ~/pic.jpg
+
+# Send an attachment with no text
+sendmsg --signal --to +18885551212 --attach ~/report.pdf
 ```
 
 > Attachments are read, base64-encoded, and sent inside the JSON request to
 > the Signal REST API. The original filename and detected MIME type are
-> preserved so recipients see the correct file name and type.
+> preserved so recipients see the correct file name and type. Attachments
+> larger than 100 MB are rejected with a warning.
+
+### Voice Messages
+
+Send an audio file as a Signal **voice note** (a playable voice message,
+not a file attachment) with `--voice`:
+
+```
+# Send a voice message
+sendmsg --signal --to +18885551212 --voice ~/note.m4a
+
+# Send a voice message to a group
+sendmsg --signal --recipients group.TestGroupHash --voice ~/briefing.ogg
+
+# Voice message with accompanying text
+sendmsg --signal --to +18885551212 --voice ~/note.m4a --text "Listen to this"
+```
+
+> Recognized audio formats: `.m4a`, `.aac`, `.ogg`, `.opus`, `.mp3`, `.wav`.
+> A voice note is sent as its own message; if you combine `--voice` with
+> `--attach`, the voice note and the file attachments are delivered as
+> separate messages.
 
 ### SMS / iMessage
 
-```
-# Send via iMessage (auto-detected)
-sendmsg --sms --to +18885551212 --text "Hello via iMessage!"
+The `--service` flag is **required** and must be either `imessage` or `sms`.
 
-# Force SMS service
+```
+# Send via iMessage
+sendmsg --sms --to +18885551212 --text "Hello via iMessage!" --service imessage
+
+# Send via SMS
 sendmsg --sms --to +18885551212 --text "Hello via SMS!" --service sms
 
 # Send with an attachment
-sendmsg --sms --to +18885551212 --text "Photo attached" --file ~/photo.jpg
+sendmsg --sms --to +18885551212 --text "Photo attached" --service imessage --file ~/photo.jpg
 ```
+
+> SMS/iMessage supports a single attachment per message; if multiple files
+> are supplied, the first valid one is used and the rest are skipped with a
+> warning.
 
 ### Bulk Send from CSV
 
 ```
 sendmsg --csv messages.csv              # Send all rows
 sendmsg --csv messages.csv --delay 2    # Wait 2 seconds between every send
+sendmsg --csv messages.csv --dry-run    # Preview every row without sending
+sendmsg --csv messages.csv --yes        # Skip the large-batch confirmation
 ```
+
+> Batches of more than 50 rows prompt for confirmation before sending. Use
+> `--yes` / `-y` to skip the prompt for unattended runs, or `--dry-run` to
+> preview exactly what would be sent first.
 
 ### Management Commands
 
@@ -205,31 +245,38 @@ sendmsg --show-config -v   # also checks whether the Signal REST API is reachabl
 
 Create a CSV file with the following columns:
 
-| Column      | Required | Description                                                                   |
-| ----------- | -------- | ----------------------------------------------------------------------------- |
-| `method`    | Yes      | `signal` or `sms` (defaults to `signal` if left blank)                        |
-| `recipient` | Yes      | Phone number, or a Signal group ID (`group.XXXX` or a raw group key)          |
-| `name`      | No       | Display name shown during status output (e.g., "Alice", "Marketing Group")    |
-| `message`   | Yes      | The message text to send                                                      |
-| `account`   | No       | Signal account phone number (defaults to `$SIGNAL_ACCOUNT` / config value)    |
-| `service`   | No       | SMS service: `imessage`, `sms`, or `auto` (SMS only)                          |
-| `file`      | No       | Path to an attachment file. `~` and environment variables are expanded.       |
-| `delay`     | No       | Seconds to wait after this row is sent (overrides the global `--delay`).      |
+| Column      | Required | Description                                                                          |
+| ----------- | -------- | ------------------------------------------------------------------------------------ |
+| `method`    | Yes      | `signal` or `sms` (defaults to `signal` if left blank)                               |
+| `recipient` | Yes      | Phone number, or a Signal group ID (`group.XXXX` or a raw group key)                 |
+| `name`      | No       | Display name shown during status output (e.g., "Alice", "Marketing Group")           |
+| `message`   | Varies   | Message text. Required for `sms` rows and for `signal` rows without a `file`/`voice`. |
+| `account`   | No       | Signal account phone number (defaults to `$SIGNAL_ACCOUNT` / config value)           |
+| `service`   | Varies   | SMS service: `imessage` or `sms`. **Required** on `sms` rows; ignored for `signal`.  |
+| `file`      | No       | Path to an attachment file. `~` and environment variables are expanded.              |
+| `voice`     | No       | Path to an audio file to send as a Signal **voice note**. Signal only.               |
+| `delay`     | No       | Seconds to wait after this row is sent (overrides the global `--delay`).             |
 
 **Notes**
 
-- A `message` is required on every row; rows with no message are skipped and reported.
-- Group recipients are auto-detected: any `recipient` that is not a `+`-prefixed phone number is treated as a Signal group ID.
+- `signal` rows may be **attachment-only** or **voice-only**: if a `file` or `voice` is present, the `message` may be left blank. `sms` rows always require a `message`.
+- The `voice` column is **Signal only**. An `sms` row with a `voice` value is skipped and reported, since SMS/iMessage has no voice-note concept.
+- A voice note is sent as its own message; if a row has both `voice` and `file`, they are delivered as separate messages.
+- Recognized voice formats: `.m4a`, `.aac`, `.ogg`, `.opus`, `.mp3`, `.wav`.
+- `sms` rows require a `service` of `imessage` or `sms`; rows with a missing or invalid service are skipped and reported.
+- Group recipients are auto-detected: any `recipient` that is not a phone number is treated as a Signal group ID. Bare (no `+`) phone numbers are recognized as numbers, not groups.
 - File paths starting with `~` are expanded to the home directory of the user running the script. If a named attachment cannot be found, a warning is printed and the message is still sent without it.
 
 ### Example CSV
 
 ```
-method,recipient,name,message,account,service,file,delay
-signal,+18885551111,Alice,Hello via Signal,+18885551111,,,
-signal,group.ZzBHd3NZO...,Team Alert,Morning update for the team,,,,
-sms,+18885552222,Bob,SMS test,,,~/pic.jpg,
-signal,+18885553333,Carol,With a delay after this row,,,,3
+method,recipient,name,message,account,service,file,voice,delay
+signal,+18885551111,Alice,Hello via Signal,+18885551111,,,,
+signal,group.ZzBHd3NZO...,Team Alert,Morning update for the team,,,,,
+signal,+18885552222,Report,,,,~/report.pdf,,
+signal,+18885556666,Briefing,,,,,~/briefing.m4a,
+sms,+18885553333,Bob,SMS test,,imessage,~/pic.jpg,,
+signal,+18885554444,Carol,With a delay after this row,,,,,3
 ```
 
 ### Status Output
@@ -237,13 +284,16 @@ signal,+18885553333,Carol,With a delay after this row,,,,3
 During a bulk send, each row prints its name (if provided):
 
 ```
-[1/4] SIGNAL → Alice (+18885551111)
-[2/4] SIGNAL → Team Alert (group.ZzBHd3NZO...)
-[3/4] SMS → Bob (+18885552222)
-[4/4] SIGNAL → Carol (+18885553333)
+[1/5] SIGNAL → Alice (+18885551111)
+[2/5] SIGNAL → Team Alert (group.ZzBHd3NZO...)
+[3/5] SIGNAL → Report (+18885552222)
+[4/5] SMS → Bob (+18885553333)
+[5/5] SIGNAL → Carol (+18885554444)
 ```
 
-If no `name` is provided, the recipient is shown instead.
+If no `name` is provided, the recipient is shown instead. A `--dry-run`
+prefixes each line with `[DRY]` and notes group/file/service details
+without sending.
 
 ---
 
@@ -279,7 +329,7 @@ $ sendmsg --show-config
 ==================================================
 ⚙️  sendmsg configuration
 ==================================================
-  Version:        4.3.0
+  Version:        5.0.0
 
   Config file:    /Users/you/.sendmsg.conf (found)
 
@@ -310,17 +360,17 @@ sendmsg --csv messages.csv
 ### Daily Broadcast
 
 ```
-method,recipient,name,message,account,service,file,delay
-signal,group.ZzBHd3NZO...,Daily Update,Good morning team! Here's your daily briefing.,+18002222222,,,
+method,recipient,name,message,account,service,file,voice,delay
+signal,group.ZzBHd3NZO...,Daily Update,Good morning team! Here's your daily briefing.,+18002222222,,,,
 ```
 
 ### Personalized Outreach
 
 ```
-method,recipient,name,message,account,service,file,delay
-signal,+18885551111,John,Hi John hope you're doing well,,,,
-sms,+18885552222,Jane,Hey Jane just checking in,,,,
-signal,+18885553333,Alex,Alex don't forget the meeting tomorrow at 3pm,,,,
+method,recipient,name,message,account,service,file,voice,delay
+signal,+18885551111,John,Hi John hope you're doing well,,,,,
+sms,+18885552222,Jane,Hey Jane just checking in,,imessage,,,
+signal,+18885553333,Alex,Alex don't forget the meeting tomorrow at 3pm,,,,,
 ```
 
 > Avoid commas inside the `message` field unless the field is quoted, since
@@ -329,18 +379,29 @@ signal,+18885553333,Alex,Alex don't forget the meeting tomorrow at 3pm,,,,
 ### With Attachments
 
 ```
-method,recipient,name,message,account,service,file,delay
-signal,+18885551111,John,Here's the report you asked for,+18002222222,,~/Downloads/report.pdf,
-sms,+18885552222,Jane,Photo from the event,,,~/Photos/event.jpg,
+method,recipient,name,message,account,service,file,voice,delay
+signal,+18885551111,John,Here's the report you asked for,+18002222222,,~/Downloads/report.pdf,,
+sms,+18885552222,Jane,Photo from the event,,imessage,~/Photos/event.jpg,,
 ```
+
+### With Voice Messages
+
+```
+method,recipient,name,message,account,service,file,voice,delay
+signal,+18885551111,John,Listen to this update,,,,~/recordings/update.m4a,
+signal,group.ZzBHd3NZO...,Team,,,,,~/recordings/standup.ogg,
+```
+
+> The `voice` column is Signal only and may be used with or without
+> `message` text.
 
 ### With Delays
 
 ```
-method,recipient,name,message,account,service,file,delay
-signal,+18885551111,Alice,First message,,,,
-signal,+18885552222,Bob,Second message after a 3s pause,,,,3
-signal,+18885553333,Charlie,Third message,,,,
+method,recipient,name,message,account,service,file,voice,delay
+signal,+18885551111,Alice,First message,,,,,
+signal,+18885552222,Bob,Second message after a 3s pause,,,,,3
+signal,+18885553333,Charlie,Third message,,,,,
 ```
 
 A per-row `delay` value takes precedence over the global `--delay` flag for
@@ -351,8 +412,12 @@ that row.
 ## Error Handling
 
 - **Unknown method:** Rows with invalid `method` values are skipped and reported in the summary.
-- **Empty message:** Rows without a `message` are skipped and reported.
+- **Missing SMS service:** `sms` rows without a valid `service` (`imessage` or `sms`) are skipped and reported.
+- **Voice on SMS:** `sms` rows that specify a `voice` file are skipped and reported, since voice notes are Signal-only.
+- **Empty message:** Rows without a `message` are skipped and reported — except `signal` rows that carry an attachment or a voice note, which are allowed.
 - **Missing attachment:** If a named file cannot be found, a warning is printed and the message is sent without the attachment.
+- **Oversized attachment:** Files larger than 100 MB are rejected with a warning before sending.
+- **Transient REST failures:** Rate-limit and server errors (HTTP 429/5xx) and network blips are retried up to 3 times with backoff.
 - **Failed sends:** Failed attempts are counted and listed in the summary.
 - **Exit codes:** The script exits with `1` if any rows fail, `0` on full success.
 
@@ -366,12 +431,14 @@ After processing all rows, a summary is printed:
 ==================================================
 📊 CSV Send Summary
 ==================================================
-  Total rows:   4
+  Total rows:   5
   ✅ Success:    3
+  ⏭️  Skipped:    1
   ❌ Failed:     1
 
-  Errors:
-    • Row 2: failed to send
+  Notes:
+    • Row 4: invalid/missing SMS service
+    • Row 5: failed to send
 ==================================================
 ```
 
@@ -379,18 +446,7 @@ After processing all rows, a summary is printed:
 
 ## Changelog
 
-### 4.3.0
-- **Fixed:** Signal attachments now send correctly. Files are base64-encoded and delivered in the JSON request body via `base64_attachments`; the previous multipart upload was rejected by the Signal REST API with HTTP 400.
-- Attachment filename and MIME type are now preserved using a data-URI form.
-
-### 4.2.0
-- **Added:** `--show-config` to report resolved settings and their sources (`-v` also checks REST API reachability).
-- Config resolution rewritten to correctly source-track values and avoid empty values silently falling through to defaults.
-
-### 4.1.0
-- **Fixed:** CSV attachment paths using `~` are now expanded, so Signal/SMS attachments from CSV rows are no longer silently dropped.
-- **Fixed (issue #3):** Group messages are detected robustly; raw (non-`group.`) group IDs are no longer mis-sent down the direct-message path.
-- **Fixed:** Multipart text/bytes join crash; consistent `+` normalization of account numbers; global `--delay` now applies between rows; missing files are skipped with a warning instead of being passed to the sender; duplicate/dead Signal send branches collapsed.
+See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 
 ---
 

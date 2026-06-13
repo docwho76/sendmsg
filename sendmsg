@@ -5,12 +5,14 @@ sendmsg — Universal message sender for Signal and SMS/iMessage.
 Usage:
     sendmsg --signal --to +18005551212 --text "Hello from Signal!"
     sendmsg --signal --recipients group_id_here --text "All members"
-    sendmsg --sms --to +18005551212 --text "Hello via SMS!"
-    sendmsg --sms --to +18005551212 --text "Hey" --file ~/photo.png
+    sendmsg --sms --to +18005551212 --text "Hello via SMS!" --service sms
+    sendmsg --sms --to +18005551212 --text "Hey" --service imessage --file ~/photo.png
     sendmsg --signal --to +18005551212 --text "Multi" --text "more text"
     sendmsg --signal --to +18005551212 --attach ~/doc.pdf ~/pic.jpg
+    sendmsg --signal --to +18005551212 --voice ~/note.m4a   # Send a voice message
     sendmsg --csv messages.csv             # Bulk send from CSV file
     sendmsg --csv messages.csv --delay 2   # Wait N seconds between sends
+    sendmsg --csv messages.csv --dry-run   # Preview without sending
     sendmsg --list-signal                  # Show linked Signal accounts
     sendmsg --link-signal                  # Link a new device to your existing Signal account
 
@@ -18,7 +20,7 @@ CSV format (messages.csv):
     method,recipient,name,message,account,service,file,delay
     signal,+1888222333,Alice,Hello via Signal,+1888222333,,,
     signal,group.ZzBHd3NZO...,Group alert,Hi team,,,,
-    sms,+1234567890,Bob,SMS test,,,~/pic.jpg,
+    sms,+1234567890,Bob,SMS test,,imessage,~/pic.jpg,
     signal,+1888222333,Carol,With delay,,,,3
 """
 
@@ -29,6 +31,7 @@ import csv
 import json
 import mimetypes
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -36,11 +39,22 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "4.3.0"
+VERSION = "5.0.0"
 
 CONFIG_PATHS = [
     os.path.expanduser("~/.sendmsg.conf"),
 ]
+
+# Maximum attachment size accepted before base64-encoding into the JSON body.
+# Large files balloon memory and request size; the REST API also rejects them.
+MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024  # 100 MB
+
+# Number of rows in a CSV batch above which we ask for confirmation,
+# unless --yes is supplied.
+CSV_CONFIRM_THRESHOLD = 50
+
+# Audio MIME types that signal-cli will accept as a voice note.
+VOICE_AUDIO_EXTS = {".m4a", ".aac", ".ogg", ".opus", ".mp3", ".wav"}
 
 
 def load_config():
@@ -126,6 +140,23 @@ def normalize_account(account):
     return account
 
 
+def looks_like_phone_number(value):
+    """Return True if value looks like a phone number.
+
+    Accepts numbers with an explicit '+', and also bare all-digit strings
+    (which a user may type without the leading '+'). This is the inverse
+    test used by is_group_id, and the two must agree on what a bare number
+    is so a phone number is never mis-routed as a group.
+    """
+    if not value:
+        return False
+    value = value.strip()
+    if value.startswith("+"):
+        return value[1:].isdigit() and len(value) > 1
+    # A bare run of digits (optionally long) is a phone number, not a group.
+    return value.isdigit()
+
+
 def is_group_id(value):
     """Return True if a recipient value looks like a Signal group ID.
 
@@ -140,57 +171,137 @@ def is_group_id(value):
     value = value.strip()
     if value.startswith("group."):
         return True
-    # Phone numbers start with '+' followed by digits. Anything else that
-    # is not a phone number is assumed to be a (raw) group ID.
-    if value.startswith("+") and value[1:].isdigit():
+    # Anything that is recognisably a phone number is NOT a group. This now
+    # correctly handles bare (no '+') phone numbers, which previously fell
+    # through and were mis-detected as group IDs.
+    if looks_like_phone_number(value):
         return False
     return True
 
 
-def send_one_signal(account, recipient, message, group_id=None, attach=None):
-    """Send a single Signal message. Returns True on success."""
+def normalize_recipient(value):
+    """Normalize a recipient for the Signal recipients[] array.
+
+    Phone numbers get a leading '+'; group IDs are passed through unchanged.
+    """
+    if not value:
+        return value
+    value = value.strip()
+    if is_group_id(value):
+        return value
+    return normalize_account(value)
+
+
+def validate_attachment(path, *, as_voice=False):
+    """Validate an attachment path.
+
+    Returns the expanded path if valid, otherwise None (with a warning).
+    """
+    if not path:
+        return None
+    path = expand_path(path)
+    if not os.path.isfile(path):
+        print(f"⚠️ Warning: attachment not found: {path}", file=sys.stderr)
+        return None
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        print(f"⚠️ Warning: cannot read attachment {path}: {e}", file=sys.stderr)
+        return None
+    if size > MAX_ATTACHMENT_BYTES:
+        print(
+            f"⚠️ Warning: attachment too large "
+            f"({size / 1024 / 1024:.1f} MB > "
+            f"{MAX_ATTACHMENT_BYTES / 1024 / 1024:.0f} MB limit): {path}",
+            file=sys.stderr,
+        )
+        return None
+    if as_voice:
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in VOICE_AUDIO_EXTS:
+            print(
+                f"⚠️ Warning: '{ext}' is not a recognized voice/audio format "
+                f"(expected one of {', '.join(sorted(VOICE_AUDIO_EXTS))}); "
+                f"sending anyway.",
+                file=sys.stderr,
+            )
+    return path
+
+
+def send_one_signal(account, recipient, message, group_id=None,
+                    attach=None, voice=None):
+    """Send a single Signal message. Returns True on success.
+
+    `attach` may be a single path or a list of paths.
+    `voice`  is a single audio path to be delivered as a voice note.
+    """
     account = normalize_account(account)
 
-    payload = {"number": account}
-    if group_id:
-        payload["recipients"] = [group_id]
-    else:
-        payload["recipients"] = [recipient]
+    target = group_id if group_id else normalize_recipient(recipient)
+    payload = {"number": account, "recipients": [target]}
 
     if message:
         payload["message"] = message
 
-    # Expand '~' / env vars; CSV supplies literal paths the shell never saw.
-    attach = expand_path(attach) if attach else None
+    # Normalize attach to a list of valid paths.
+    attach_list = []
+    if attach:
+        candidates = attach if isinstance(attach, (list, tuple)) else [attach]
+        for c in candidates:
+            valid = validate_attachment(c)
+            if valid:
+                attach_list.append(valid)
 
-    # If an attachment was specified but does not exist, warn loudly rather
-    # than silently sending text-only.
-    if attach and not os.path.isfile(attach):
-        print(f"⚠️ Warning: attachment not found, sending without it: {attach}", file=sys.stderr)
-        attach = None
+    voice_path = validate_attachment(voice, as_voice=True) if voice else None
 
-    has_attachment = bool(attach)
-    if not message and not has_attachment:
+    has_attachment = bool(attach_list)
+    has_voice = bool(voice_path)
+
+    if not message and not has_attachment and not has_voice:
         print(
-            f"❌ Signal send skipped: no message text and no valid attachment "
+            f"❌ Signal send skipped: no message text, attachment, or voice note "
             f"(recipient: {group_id or recipient})",
             file=sys.stderr,
         )
         return False
 
+    # A voice note is sent as its own message (a voice note cannot be mixed
+    # with arbitrary file attachments in a single send).
+    overall_ok = True
+
+    if has_voice:
+        voice_payload = {"number": account, "recipients": [target], "voice": True}
+        if message and not has_attachment:
+            # Attach the text to the voice message if there are no other files.
+            voice_payload["message"] = message
+        vres = signal_rest_post("/v2/send", payload=voice_payload, files=[voice_path])
+        overall_ok = overall_ok and (vres is not None)
+        # If text rode along with the voice note, don't send it again below.
+        if has_attachment and message:
+            pass  # text will be sent with the attachments below
+        else:
+            message = None  # consumed
+
     if has_attachment:
-        result = signal_rest_post("/v2/send", payload=payload, files=[attach])
-    else:
-        result = signal_rest_post("/v2/send", payload=payload)
+        files_payload = {"number": account, "recipients": [target]}
+        if message:
+            files_payload["message"] = message
+        ares = signal_rest_post("/v2/send", payload=files_payload, files=attach_list)
+        overall_ok = overall_ok and (ares is not None)
+    elif message and not has_voice:
+        # Pure text-only send.
+        tres = signal_rest_post("/v2/send", payload=payload)
+        overall_ok = overall_ok and (tres is not None)
 
-    return result is not None
+    return overall_ok
 
 
-def send_one_sms(to, message, service=None, file=None):
-    """Send a single SMS/iMessage. Returns True on success."""
-    cmd = ["imsg", "send", "--to", to]
-    if service:
-        cmd.extend(["--service", service])
+def send_one_sms(to, message, service, file=None):
+    """Send a single SMS/iMessage. Returns True on success.
+
+    `service` must be 'sms' or 'imessage' (required — no auto-detect).
+    """
+    cmd = ["imsg", "send", "--to", to, "--service", service]
     cmd.extend(["--text", message])
     if file:
         file = expand_path(file)
@@ -199,10 +310,18 @@ def send_one_sms(to, message, service=None, file=None):
         else:
             print(f"⚠️ Warning: file not found, skipping attachment: {file}", file=sys.stderr)
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    if not shutil.which("imsg"):
+        print("❌ SMS send failed: 'imsg' CLI not found on PATH.", file=sys.stderr)
+        return False
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as e:
+        print(f"❌ SMS send failed: could not run 'imsg': {e}", file=sys.stderr)
+        return False
+
     if result.returncode == 0:
-        service_label = service.upper() if service else "AUTO"
-        print(f"✅ SMS/iMessage sent to {to} (service: {service_label})")
+        print(f"✅ SMS/iMessage sent to {to} (service: {service.upper()})")
         return True
     else:
         print(f"❌ SMS send failed (exit {result.returncode}): {result.stderr.strip()}", file=sys.stderr)
@@ -247,32 +366,55 @@ def signal_rest_post(endpoint, payload=None, files=None):
 
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    full_body = body
 
-    req = urllib.request.Request(url, data=full_body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            resp_data = resp.read().decode("utf-8")
-            if resp_data.strip():
-                result = json.loads(resp_data)
-                if isinstance(result, dict) and "error" in result:
-                    print(
-                        f"❌ Signal REST error: {result['error'].strip()}",
-                        file=sys.stderr,
-                    )
-                    return None
-                return result
-            return {}
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        print(
-            f"❌ Signal REST error: HTTP {e.code} — {body[:500]}",
-            file=sys.stderr,
-        )
-        return None
-    except urllib.error.URLError as e:
-        print(f"❌ Cannot reach Signal REST API at {SIGNAL_REST_URL}: {e.reason}", file=sys.stderr)
-        return None
+    # Retry transient failures (network blips, 429, 5xx) with backoff.
+    max_attempts = 3
+    backoff = 2.0
+    for attempt in range(1, max_attempts + 1):
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp_data = resp.read().decode("utf-8")
+                if resp_data.strip():
+                    result = json.loads(resp_data)
+                    if isinstance(result, dict) and "error" in result:
+                        print(
+                            f"❌ Signal REST error: {result['error'].strip()}",
+                            file=sys.stderr,
+                        )
+                        return None
+                    return result
+                return {}
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            # Retry on rate-limit / server errors; fail fast otherwise.
+            if e.code in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                wait = backoff * attempt
+                print(
+                    f"⚠️ Signal REST HTTP {e.code}; retrying in {wait:.0f}s "
+                    f"(attempt {attempt}/{max_attempts})...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            print(
+                f"❌ Signal REST error: HTTP {e.code} — {err_body[:500]}",
+                file=sys.stderr,
+            )
+            return None
+        except urllib.error.URLError as e:
+            if attempt < max_attempts:
+                wait = backoff * attempt
+                print(
+                    f"⚠️ Cannot reach Signal REST API ({e.reason}); retrying in "
+                    f"{wait:.0f}s (attempt {attempt}/{max_attempts})...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            print(f"❌ Cannot reach Signal REST API at {SIGNAL_REST_URL}: {e.reason}", file=sys.stderr)
+            return None
+    return None
 
 
 def signal_rest_get(endpoint):
@@ -306,69 +448,40 @@ def cmd_signal(args):
         sys.exit(1)
 
     attach_files = getattr(args, "attach", None) or getattr(args, "file", None)
+    voice_file = getattr(args, "voice", None)
 
-    # Text or an attachment is required in ALL cases, including group sends.
-    if not args.text and not attach_files:
-        print("❌ Error: --text <message> or --attach <file> is required.", file=sys.stderr)
+    # Text, an attachment, or a voice note is required in ALL cases.
+    if not args.text and not attach_files and not voice_file:
+        print("❌ Error: --text <message>, --attach <file>, or --voice <audio> is required.", file=sys.stderr)
         sys.exit(1)
 
     account = normalize_account(args.account or SIGNAL_DEFAULT_ACCOUNT)
 
-    # Build the JSON payload for /v2/send
-    payload = {"number": account}
     if args.recipients:
-        # Send to a Signal group — use recipients array with the group ID.
-        payload["recipients"] = [args.recipients]
+        recipient = None
+        group_id = args.recipients
     else:
-        # Send to an individual recipient. The REST API accepts a
-        # recipients array for direct messages too; using it consistently
-        # avoids the 1:1-vs-group dispatch mismatch behind issue #3.
-        payload["recipients"] = [args.to[0]]
+        recipient = args.to[0]
+        group_id = None
 
-    # Message text (join multiple --text args)
-    if args.text:
-        payload["message"] = "\n".join(args.text)
+    message = "\n".join(args.text) if args.text else None
 
-    # Attachments
-    if attach_files and len(attach_files) > 0:
-        if len(attach_files) == 1:
-            # Single file — send as multipart with the message.
-            result = signal_rest_post("/v2/send", payload=payload, files=attach_files)
-        else:
-            # Multiple files: send the text first, then each attachment.
-            multi_payload = {"number": account, "message": payload.get("message", "")}
-            multi_payload["recipients"] = payload["recipients"]
+    ok = send_one_signal(
+        account=account,
+        recipient=recipient,
+        message=message,
+        group_id=group_id,
+        attach=attach_files,
+        voice=voice_file,
+    )
 
-            # Only send a standalone text message if there is actual text.
-            result = None
-            if multi_payload["message"]:
-                result = signal_rest_post("/v2/send", payload=multi_payload)
-                if result is None:
-                    sys.exit(1)
-
-            # Then send each attachment.
-            for fpath in attach_files:
-                att_payload = {"number": account, "recipients": payload["recipients"]}
-                att_result = signal_rest_post("/v2/send", payload=att_payload, files=[fpath])
-                if att_result is None:
-                    print(f"⚠️ Attachment failed: {fpath}", file=sys.stderr)
-                else:
-                    result = att_result
-    else:
-        # Text-only send (direct or group).
-        result = signal_rest_post("/v2/send", payload=payload)
-
-    if result is not None:
+    if ok:
         if args.recipients:
             print(f"✅ Signal message sent to group {args.recipients}")
         elif args.to:
-            print(f"✅ Signal message sent to {args.to[0]}")
+            print(f"✅ Signal message sent to {normalize_recipient(args.to[0])}")
         else:
             print("✅ Signal message sent")
-        if args.verbose and isinstance(result, dict):
-            for key, value in result.items():
-                if key not in ("success",):
-                    print(f"   {key}: {value}")
     else:
         print("❌ Signal message send failed.", file=sys.stderr)
         sys.exit(1)
@@ -382,30 +495,33 @@ def cmd_sms(args):
     if not args.text:
         print("❌ Error: --text <message> is required for SMS.", file=sys.stderr)
         sys.exit(1)
+    if not args.service:
+        print("❌ Error: --service <sms|imessage> is required for SMS.", file=sys.stderr)
+        sys.exit(1)
 
-    cmd = ["imsg", "send", "--to", args.to[0]]
-    if args.service:
-        cmd.extend(["--service", args.service])
     msg_text = "\n".join(args.text)
-    cmd.extend(["--text", msg_text])
-
     attach_files = getattr(args, "file", None) or getattr(args, "attach", None)
+
+    # imsg accepts a single --file; send the first valid one and warn on extras.
+    chosen_file = None
     if attach_files:
         for f in attach_files:
-            f = expand_path(f)
-            if not os.path.isfile(f):
-                print(f"⚠️ Warning: file not found, skipping: {f}", file=sys.stderr)
+            ef = expand_path(f)
+            if not os.path.isfile(ef):
+                print(f"⚠️ Warning: file not found, skipping: {ef}", file=sys.stderr)
                 continue
-            cmd.extend(["--file", f])
+            if chosen_file is None:
+                chosen_file = ef
+            else:
+                print(f"⚠️ Warning: SMS supports one attachment; ignoring extra file: {ef}", file=sys.stderr)
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        service_label = args.service.upper() if args.service else "AUTO"
-        print(f"✅ SMS/iMessage sent to {args.to[0]} (service: {service_label})")
-    else:
-        print(f"❌ SMS send failed (exit {result.returncode})", file=sys.stderr)
-        if result.stderr:
-            print(f"   {result.stderr.strip()}", file=sys.stderr)
+    ok = send_one_sms(
+        to=args.to[0],
+        message=msg_text,
+        service=args.service,
+        file=chosen_file,
+    )
+    if not ok:
         sys.exit(1)
 
 
@@ -413,7 +529,7 @@ def cmd_csv(args):
     """Bulk send messages from a CSV file.
 
     Expected CSV columns:
-        method, recipient, name, message, account, service, file, delay
+        method, recipient, name, message, account, service, file, voice, delay
     """
     filepath = args.csv
     if not os.path.isfile(filepath):
@@ -432,9 +548,33 @@ def cmd_csv(args):
         print("❌ Error: CSV file is empty (no data rows).", file=sys.stderr)
         sys.exit(1)
 
+    # Count the rows that will actually be attempted (non-blank).
+    actionable = [
+        r for r in rows
+        if (r.get("method", "").strip()
+            or r.get("message", "").strip()
+            or r.get("recipient", "").strip()
+            or r.get("file", "").strip()
+            or r.get("voice", "").strip())
+    ]
+
+    if args.dry_run:
+        print(f"🔎 Dry run: {len(actionable)} row(s) would be processed from {filepath}\n")
+    elif len(actionable) > CSV_CONFIRM_THRESHOLD and not args.yes:
+        try:
+            resp = input(
+                f"⚠️ About to send {len(actionable)} messages. Continue? [y/N] "
+            ).strip().lower()
+        except EOFError:
+            resp = "n"
+        if resp not in ("y", "yes"):
+            print("Aborted.")
+            sys.exit(1)
+
     total = len(rows)
     success = 0
     failed = 0
+    skipped = 0
     errors = []
 
     for i, row in enumerate(rows, 1):
@@ -442,9 +582,10 @@ def cmd_csv(args):
         message = row.get("message", "").strip()
         to = row.get("recipient", "").strip()
         name = row.get("name", "").strip()
+        voice_path = row.get("voice", "").strip() or None
 
         # Skip blank rows
-        if not method and not message and not to:
+        if not method and not message and not to and not voice_path:
             continue
 
         if not method:
@@ -456,15 +597,9 @@ def cmd_csv(args):
             errors.append(f"Row {i}: unknown method '{method}'")
             continue
 
-        if not message:
-            print(f"⚠️ Row {i}: empty message — skipping", file=sys.stderr)
-            failed += 1
-            errors.append(f"Row {i}: empty message")
-            continue
-
         # Common fields
         account = row.get("account", "").strip() or SIGNAL_DEFAULT_ACCOUNT
-        service = row.get("service", "").strip() or None
+        service = row.get("service", "").strip().lower() or None
         file_path = row.get("file", "").strip() or None
         delay_str = row.get("delay", "").strip()
         try:
@@ -473,8 +608,55 @@ def cmd_csv(args):
             print(f"⚠️ Row {i}: invalid delay '{delay_str}' — ignoring", file=sys.stderr)
             row_delay = None
 
+        # A message is required UNLESS there is an attachment or a voice note
+        # (Signal can send attachment-only / voice-only messages). SMS still
+        # requires text.
+        has_signal_media = method == "signal" and (file_path or voice_path)
+        if not message and not has_signal_media:
+            print(f"⚠️ Row {i}: empty message — skipping", file=sys.stderr)
+            skipped += 1
+            errors.append(f"Row {i}: empty message")
+            continue
+
+        if method == "sms":
+            if voice_path:
+                print(
+                    f"⚠️ Row {i}: voice notes are only supported for Signal "
+                    f"(method 'signal') — skipping",
+                    file=sys.stderr,
+                )
+                failed += 1
+                errors.append(f"Row {i}: voice not supported for SMS")
+                continue
+            if service not in ("sms", "imessage"):
+                print(
+                    f"⚠️ Row {i}: SMS requires service 'sms' or 'imessage' "
+                    f"(got '{service or ''}') — skipping",
+                    file=sys.stderr,
+                )
+                failed += 1
+                errors.append(f"Row {i}: invalid/missing SMS service")
+                continue
+
         label = f"{name} ({to})" if name else to or "(group)"
-        print(f"[{i}/{total}] {method.upper()} → {label}")
+        prefix = "[DRY] " if args.dry_run else ""
+        print(f"{prefix}[{i}/{total}] {method.upper()} → {label}")
+
+        if args.dry_run:
+            # Report what would happen without sending.
+            extras = []
+            if file_path:
+                extras.append(f"file={file_path}")
+            if voice_path:
+                extras.append(f"voice={voice_path}")
+            if method == "signal" and is_group_id(to):
+                extras.append("group")
+            if method == "sms":
+                extras.append(f"service={service}")
+            if extras:
+                print(f"        ({', '.join(extras)})")
+            success += 1
+            continue
 
         if method == "signal":
             # Detect groups robustly (issue #3): raw base64 group IDs do NOT
@@ -487,10 +669,11 @@ def cmd_csv(args):
                 message=message,
                 group_id=group_id,
                 attach=file_path,
+                voice=voice_path,
             )
         else:  # sms
             result = send_one_sms(
-                to=to,
+                to=normalize_account(to),
                 message=message,
                 service=service,
                 file=file_path,
@@ -504,20 +687,21 @@ def cmd_csv(args):
 
         # Per-row delay overrides global; otherwise use the global --delay.
         effective_delay = row_delay if row_delay is not None else global_delay
-        if effective_delay > 0:
+        if effective_delay > 0 and not args.dry_run:
             time.sleep(effective_delay)
 
     # Summary
     print()
     print("=" * 50)
-    print("📊 CSV Send Summary")
+    print("📊 CSV Send Summary" + (" (DRY RUN)" if args.dry_run else ""))
     print("=" * 50)
     print(f"  Total rows:   {total}")
     print(f"  ✅ Success:    {success}")
+    print(f"  ⏭️  Skipped:    {skipped}")
     print(f"  ❌ Failed:     {failed}")
     if errors:
         print()
-        print("  Errors:")
+        print("  Notes:")
         for e in errors:
             print(f"    • {e}")
     print("=" * 50)
@@ -597,6 +781,14 @@ def cmd_link_signal(args):
     This prints the sgnl:// URL to stdout, then waits for the user to scan/confirm.
     """
     name = args.name or "automation"
+
+    # Snapshot existing accounts so we can detect a genuinely NEW link rather
+    # than reporting success just because a primary account already exists.
+    before = signal_rest_get("/v1/accounts")
+    before_set = set()
+    if isinstance(before, list):
+        before_set = {str(a) for a in before}
+
     payload = {"name": name}
     result = signal_rest_post("/v1/link", payload=payload)
     if result is None:
@@ -619,12 +811,15 @@ def cmd_link_signal(args):
     start = time.time()
     while time.time() - start < 120:
         time.sleep(3)
-        result = signal_rest_get("/v1/accounts")
-        if result and (isinstance(result, list) and len(result) > 0):
-            print(f"✅ Device linked! Account: {result}")
-            return
+        current = signal_rest_get("/v1/accounts")
+        if isinstance(current, list):
+            current_set = {str(a) for a in current}
+            new_accounts = current_set - before_set
+            if new_accounts:
+                print(f"✅ Device linked! New account(s): {', '.join(sorted(new_accounts))}")
+                return
 
-    print("⚠️ Linking timed out. Please try again.", file=sys.stderr)
+    print("⚠️ Linking timed out (no new account detected). Please try again.", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -639,16 +834,18 @@ def main():
             "Examples:\n"
             "  %(prog)s --signal --to +18005551212 --text 'Hello!'\n"
             "  %(prog)s --signal --recipients GROUP_ID --text 'Hello group!'\n"
-            "  %(prog)s --sms --to +18005551212 --text 'Text via SMS'\n"
-            "  %(prog)s --sms --to +18005551212 --text 'Hey' --file ~/pic.jpg\n"
+            "  %(prog)s --signal --to +18005551212 --voice ~/note.m4a\n"
+            "  %(prog)s --sms --to +18005551212 --text 'Text' --service sms\n"
+            "  %(prog)s --sms --to +18005551212 --text 'Hey' --service imessage --file ~/pic.jpg\n"
             "  %(prog)s --csv messages.csv\n"
             "  %(prog)s --csv messages.csv --delay 2\n"
+            "  %(prog)s --csv messages.csv --dry-run\n"
             "  %(prog)s --list-signal\n"
-            "  %(prog)s --link-signal\n"
             "  %(prog)s --link-signal --name 'my-automation'\n"
             "\n"
             "CSV columns: method, recipient, name, message, account, service, file, delay\n"
             "The 'name' field is printed in the status output during CSV sends.\n"
+            "For SMS rows the 'service' column must be 'sms' or 'imessage'.\n"
             f"Signal REST API: {SIGNAL_REST_URL}\n"
             "Config file: ~/.sendmsg.conf\n"
             "  [settings]\n"
@@ -677,6 +874,7 @@ def main():
     signal_grp = parser.add_argument_group("Signal options")
     signal_grp.add_argument("--account", metavar="PHONE", help="Signal account phone number to use")
     signal_grp.add_argument("--recipients", metavar="RECIPIENTS", help="Send to Signal group ID (no --to needed)")
+    signal_grp.add_argument("--voice", metavar="AUDIO", help="Send an audio file as a Signal voice message")
     signal_grp.add_argument("--name", metavar="NAME", help="Device name for Signal linking (default: 'automation')")
 
     # Management commands
@@ -688,26 +886,45 @@ def main():
 
     # SMS-specific
     sms_grp = parser.add_argument_group("SMS/iMessage options")
-    sms_grp.add_argument("--service", choices=["imessage", "sms", "auto"], help="Force service (default: auto-detect)")
+    sms_grp.add_argument("--service", choices=["imessage", "sms"],
+                         help="Service to use: 'imessage' or 'sms' (required for --sms)")
 
     # CSV-specific
     csv_grp = parser.add_argument_group("CSV options")
     csv_grp.add_argument("--delay", metavar="SECONDS", help="Wait N seconds between CSV row sends (default: 0)")
+    csv_grp.add_argument("--dry-run", action="store_true", help="Preview a CSV batch without sending")
+    csv_grp.add_argument("--yes", "-y", action="store_true",
+                         help="Skip the large-batch confirmation prompt")
 
     args = parser.parse_args()
 
     # cmd_signal still reads args.attach in places; keep an alias.
     args.attach = args.file
 
-    # Validate: must have a method or management command
-    if not any([args.signal, args.sms, args.csv, args.list_signal, args.link_signal, args.show_config]):
+    # Validate: must have exactly one method or management command.
+    methods = {
+        "--signal": args.signal,
+        "--sms": args.sms,
+        "--csv": bool(args.csv),
+        "--list-signal": args.list_signal,
+        "--link-signal": args.link_signal,
+        "--show-config": args.show_config,
+    }
+    chosen = [name for name, on in methods.items() if on]
+
+    if not chosen:
         parser.print_help()
         print("\n❌ Error: Specify --signal, --sms, --csv, --list-signal, --link-signal, or --show-config", file=sys.stderr)
         sys.exit(1)
 
-    if sum([bool(args.signal), bool(args.sms), bool(args.csv)]) > 1:
-        print("❌ Error: Choose only one method (--signal, --sms, or --csv).", file=sys.stderr)
+    if len(chosen) > 1:
+        print(f"❌ Error: Choose only one action (got: {', '.join(chosen)}).", file=sys.stderr)
         sys.exit(1)
+
+    # --voice is single-file only.
+    if args.voice and args.file and len(args.file) > 0:
+        # Allow voice + attachments, but warn it's two separate sends.
+        print("ℹ️  Note: --voice and --attach will be sent as separate messages.", file=sys.stderr)
 
     # Set defaults
     if args.link_signal and not args.name:
