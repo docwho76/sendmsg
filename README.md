@@ -329,7 +329,7 @@ $ sendmsg --show-config
 ==================================================
 ⚙️  sendmsg configuration
 ==================================================
-  Version:        5.0.0
+  Version:        5.1.0
 
   Config file:    /Users/you/.sendmsg.conf (found)
 
@@ -441,6 +441,12 @@ After processing all rows, a summary is printed:
     • Row 5: failed to send
 ==================================================
 ```
+
+> Intentional skips — unknown method, missing/invalid SMS service, voice on
+> an SMS row, and empty messages — are counted under **Skipped**, not
+> **Failed**. Only genuine send failures count as **Failed**, and the exit
+> code is `1` only when something actually failed to send. Add `--json` for a
+> machine-readable summary in unattended runs.
 
 ---
 

@@ -2,6 +2,23 @@
 
 All notable changes to `sendmsg` are documented here.
 
+## 5.1.0
+
+### Added
+- **Multiple recipients per Signal send:** `--recipients` now accepts more than one value, and `--to` accepts multiple numbers, so a single invocation can fan out to several groups and/or direct recipients. Each target is sent independently and reported individually; the command exits non-zero if any target fails.
+- **`--json` CSV summary:** Emits a machine-readable JSON summary (totals, per-bucket counts, and notes) for unattended runs, as an alternative to the formatted text summary.
+- **SMS timeout and retry:** `imsg` invocations now run with a 60-second timeout and are retried up to 3 times with backoff on timeout or transient failure, matching the resilience of the Signal REST path. Previously a hung Messages app could stall an entire batch and SMS sends had no retry.
+- **Startup configuration warnings:** A `signal_rest_url` that is not a well-formed `http(s)://` URL now warns at startup, and attempting a Signal send from the built-in placeholder account (`+1234567890`) warns that no real account is configured.
+
+### Changed
+- **Skip vs. fail accounting corrected.** Intentional skips — unknown `method`, missing/invalid SMS `service`, `voice` on an SMS row, and empty messages — are now counted under **Skipped** rather than **Failed**. The process exit code is `1` only when a genuine send fails, so deliberate skips no longer cause unattended runs to report failure.
+- **Dry runs no longer report sends as successful.** A `--dry-run` now reports a separate "would send" count instead of incrementing the success total for rows that were never sent.
+- Empty-message skip notes now distinguish SMS rows (which always require text) from Signal rows (which may be attachment- or voice-only).
+
+### Fixed
+- **`--link-signal` false success:** The account snapshot used for new-link detection now tolerates all response shapes returned by the REST API (bare list, `{"accounts": [...]}`, and `{"number": ...}`). Previously a dict-shaped response produced an empty baseline, so any pre-existing account could be misreported as a newly linked device. Account listing and link detection now share one shape-tolerant helper.
+- The `--help` epilog and module docstring CSV column lists now include the `voice` column, matching the documented CSV format and the code.
+
 ## 5.0.0
 
 ### Added
