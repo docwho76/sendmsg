@@ -17,11 +17,11 @@ Usage:
     sendmsg --link-signal                  # Link a new device to your existing Signal account
 
 CSV format (messages.csv):
-    method,recipient,name,message,account,service,file,delay
-    signal,+1888222333,Alice,Hello via Signal,+1888222333,,,
-    signal,group.ZzBHd3NZO...,Group alert,Hi team,,,,
-    sms,+1234567890,Bob,SMS test,,imessage,~/pic.jpg,
-    signal,+1888222333,Carol,With delay,,,,3
+    method,recipient,name,message,account,service,file,voice,delay
+    signal,+1888222333,Alice,Hello via Signal,+1888222333,,,,
+    signal,group.ZzBHd3NZO...,Group alert,Hi team,,,,,
+    sms,+1234567890,Bob,SMS test,,imessage,~/pic.jpg,,
+    signal,+1888222333,Carol,With delay,,,,,3
 """
 
 import argparse
@@ -39,7 +39,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 
 CONFIG_PATHS = [
     os.path.expanduser("~/.sendmsg.conf"),
@@ -107,6 +107,18 @@ def load_config():
 CFG = load_config()
 SIGNAL_REST_URL = CFG["signal_rest_url"]
 SIGNAL_DEFAULT_ACCOUNT = CFG["signal_default_account"]
+
+# The built-in default account is a placeholder; sending from it will fail at
+# the Signal server. Track whether the resolved account is still the default
+# so we can warn before attempting a real send.
+PLACEHOLDER_ACCOUNT = "+1234567890"
+
+if not (SIGNAL_REST_URL.startswith("http://") or SIGNAL_REST_URL.startswith("https://")):
+    print(
+        f"⚠️ Warning: signal_rest_url '{SIGNAL_REST_URL}' does not look like a "
+        f"valid URL (expected http:// or https://).",
+        file=sys.stderr,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +249,14 @@ def send_one_signal(account, recipient, message, group_id=None,
     """
     account = normalize_account(account)
 
+    if account == PLACEHOLDER_ACCOUNT:
+        print(
+            f"⚠️ Warning: sending from the placeholder account {PLACEHOLDER_ACCOUNT}. "
+            f"Set SIGNAL_ACCOUNT or signal_default_account in ~/.sendmsg.conf, "
+            f"or pass --account.",
+            file=sys.stderr,
+        )
+
     target = group_id if group_id else normalize_recipient(recipient)
     payload = {"number": account, "recipients": [target]}
 
@@ -314,18 +334,46 @@ def send_one_sms(to, message, service, file=None):
         print("❌ SMS send failed: 'imsg' CLI not found on PATH.", file=sys.stderr)
         return False
 
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-    except OSError as e:
-        print(f"❌ SMS send failed: could not run 'imsg': {e}", file=sys.stderr)
-        return False
+    # imsg can hang if the Messages app is unresponsive; bound each attempt
+    # with a timeout and retry a couple of times on transient failures.
+    max_attempts = 3
+    backoff = 2.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            if attempt < max_attempts:
+                wait = backoff * attempt
+                print(
+                    f"⚠️ SMS send to {to} timed out; retrying in {wait:.0f}s "
+                    f"(attempt {attempt}/{max_attempts})...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            print(f"❌ SMS send failed: 'imsg' timed out after {max_attempts} attempts.", file=sys.stderr)
+            return False
+        except OSError as e:
+            print(f"❌ SMS send failed: could not run 'imsg': {e}", file=sys.stderr)
+            return False
 
-    if result.returncode == 0:
-        print(f"✅ SMS/iMessage sent to {to} (service: {service.upper()})")
-        return True
-    else:
+        if result.returncode == 0:
+            print(f"✅ SMS/iMessage sent to {to} (service: {service.upper()})")
+            return True
+
+        if attempt < max_attempts:
+            wait = backoff * attempt
+            print(
+                f"⚠️ SMS send to {to} failed (exit {result.returncode}); retrying in "
+                f"{wait:.0f}s (attempt {attempt}/{max_attempts})...",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+            continue
         print(f"❌ SMS send failed (exit {result.returncode}): {result.stderr.strip()}", file=sys.stderr)
         return False
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -456,34 +504,39 @@ def cmd_signal(args):
         sys.exit(1)
 
     account = normalize_account(args.account or SIGNAL_DEFAULT_ACCOUNT)
-
-    if args.recipients:
-        recipient = None
-        group_id = args.recipients
-    else:
-        recipient = args.to[0]
-        group_id = None
-
     message = "\n".join(args.text) if args.text else None
 
-    ok = send_one_signal(
-        account=account,
-        recipient=recipient,
-        message=message,
-        group_id=group_id,
-        attach=attach_files,
-        voice=voice_file,
-    )
+    # Build the list of targets. --recipients values are treated as group IDs
+    # or raw recipients; --to values are direct phone numbers. Either may
+    # contain more than one entry, so a single invocation can fan out.
+    targets = []  # list of (recipient, group_id, label)
+    if args.recipients:
+        for r in args.recipients:
+            if is_group_id(r):
+                targets.append((None, r, f"group {r}"))
+            else:
+                targets.append((r, None, normalize_recipient(r)))
+    if args.to:
+        for t in args.to:
+            targets.append((t, None, normalize_recipient(t)))
 
-    if ok:
-        if args.recipients:
-            print(f"✅ Signal message sent to group {args.recipients}")
-        elif args.to:
-            print(f"✅ Signal message sent to {normalize_recipient(args.to[0])}")
+    all_ok = True
+    for recipient, group_id, label in targets:
+        ok = send_one_signal(
+            account=account,
+            recipient=recipient,
+            message=message,
+            group_id=group_id,
+            attach=attach_files,
+            voice=voice_file,
+        )
+        if ok:
+            print(f"✅ Signal message sent to {label}")
         else:
-            print("✅ Signal message sent")
-    else:
-        print("❌ Signal message send failed.", file=sys.stderr)
+            print(f"❌ Signal message send failed: {label}", file=sys.stderr)
+            all_ok = False
+
+    if not all_ok:
         sys.exit(1)
 
 
@@ -575,6 +628,7 @@ def cmd_csv(args):
     success = 0
     failed = 0
     skipped = 0
+    previewed = 0
     errors = []
 
     for i, row in enumerate(rows, 1):
@@ -593,7 +647,7 @@ def cmd_csv(args):
 
         if method not in ("signal", "sms"):
             print(f"⚠️ Row {i}: unknown method '{method}' — skipping", file=sys.stderr)
-            failed += 1
+            skipped += 1
             errors.append(f"Row {i}: unknown method '{method}'")
             continue
 
@@ -613,9 +667,13 @@ def cmd_csv(args):
         # requires text.
         has_signal_media = method == "signal" and (file_path or voice_path)
         if not message and not has_signal_media:
-            print(f"⚠️ Row {i}: empty message — skipping", file=sys.stderr)
+            if method == "sms":
+                reason = "empty message (SMS requires text)"
+            else:
+                reason = "empty message (no text, attachment, or voice)"
+            print(f"⚠️ Row {i}: {reason} — skipping", file=sys.stderr)
             skipped += 1
-            errors.append(f"Row {i}: empty message")
+            errors.append(f"Row {i}: {reason}")
             continue
 
         if method == "sms":
@@ -625,7 +683,7 @@ def cmd_csv(args):
                     f"(method 'signal') — skipping",
                     file=sys.stderr,
                 )
-                failed += 1
+                skipped += 1
                 errors.append(f"Row {i}: voice not supported for SMS")
                 continue
             if service not in ("sms", "imessage"):
@@ -634,7 +692,7 @@ def cmd_csv(args):
                     f"(got '{service or ''}') — skipping",
                     file=sys.stderr,
                 )
-                failed += 1
+                skipped += 1
                 errors.append(f"Row {i}: invalid/missing SMS service")
                 continue
 
@@ -655,7 +713,7 @@ def cmd_csv(args):
                 extras.append(f"service={service}")
             if extras:
                 print(f"        ({', '.join(extras)})")
-            success += 1
+            previewed += 1
             continue
 
         if method == "signal":
@@ -691,20 +749,36 @@ def cmd_csv(args):
             time.sleep(effective_delay)
 
     # Summary
-    print()
-    print("=" * 50)
-    print("📊 CSV Send Summary" + (" (DRY RUN)" if args.dry_run else ""))
-    print("=" * 50)
-    print(f"  Total rows:   {total}")
-    print(f"  ✅ Success:    {success}")
-    print(f"  ⏭️  Skipped:    {skipped}")
-    print(f"  ❌ Failed:     {failed}")
-    if errors:
+    if getattr(args, "json_output", False):
+        summary = {
+            "total": total,
+            "success": success,
+            "skipped": skipped,
+            "failed": failed,
+            "dry_run": bool(args.dry_run),
+            "notes": errors,
+        }
+        if args.dry_run:
+            summary["would_send"] = previewed
+        print(json.dumps(summary, indent=2))
+    else:
         print()
-        print("  Notes:")
-        for e in errors:
-            print(f"    • {e}")
-    print("=" * 50)
+        print("=" * 50)
+        print("📊 CSV Send Summary" + (" (DRY RUN)" if args.dry_run else ""))
+        print("=" * 50)
+        print(f"  Total rows:   {total}")
+        if args.dry_run:
+            print(f"  🔎 Would send: {previewed}")
+        else:
+            print(f"  ✅ Success:    {success}")
+        print(f"  ⏭️  Skipped:    {skipped}")
+        print(f"  ❌ Failed:     {failed}")
+        if errors:
+            print()
+            print("  Notes:")
+            for e in errors:
+                print(f"    • {e}")
+        print("=" * 50)
 
     if failed > 0:
         sys.exit(1)
@@ -750,6 +824,24 @@ def cmd_show_config(args):
         print("=" * 50)
 
 
+def _extract_accounts(result):
+    """Normalize the various shapes /v1/accounts may return into a list of str.
+
+    The REST API has returned a bare list, a {'accounts': [...]} dict, and a
+    single {'number': ...} dict across versions. Returns [] for None/unknown.
+    """
+    if result is None:
+        return []
+    if isinstance(result, list):
+        return [str(a) for a in result]
+    if isinstance(result, dict):
+        if "accounts" in result and isinstance(result["accounts"], list):
+            return [str(a) for a in result["accounts"]]
+        if "number" in result:
+            return [str(result["number"])]
+    return []
+
+
 def cmd_list_signal(args):
     """List linked Signal accounts via the REST API."""
     result = signal_rest_get("/v1/accounts")
@@ -757,14 +849,7 @@ def cmd_list_signal(args):
         print(f"❌ Failed to list accounts (cannot reach {SIGNAL_REST_URL})", file=sys.stderr)
         sys.exit(1)
 
-    if isinstance(result, list):
-        accounts = [str(a) for a in result]
-    elif isinstance(result, dict) and "accounts" in result:
-        accounts = result["accounts"]
-    elif isinstance(result, dict) and "number" in result:
-        accounts = [result["number"]]
-    else:
-        accounts = [str(result)]
+    accounts = _extract_accounts(result)
 
     if not accounts:
         print("No Signal accounts linked. Use --link-signal to set one up.")
@@ -785,9 +870,7 @@ def cmd_link_signal(args):
     # Snapshot existing accounts so we can detect a genuinely NEW link rather
     # than reporting success just because a primary account already exists.
     before = signal_rest_get("/v1/accounts")
-    before_set = set()
-    if isinstance(before, list):
-        before_set = {str(a) for a in before}
+    before_set = set(_extract_accounts(before))
 
     payload = {"name": name}
     result = signal_rest_post("/v1/link", payload=payload)
@@ -811,13 +894,11 @@ def cmd_link_signal(args):
     start = time.time()
     while time.time() - start < 120:
         time.sleep(3)
-        current = signal_rest_get("/v1/accounts")
-        if isinstance(current, list):
-            current_set = {str(a) for a in current}
-            new_accounts = current_set - before_set
-            if new_accounts:
-                print(f"✅ Device linked! New account(s): {', '.join(sorted(new_accounts))}")
-                return
+        current_set = set(_extract_accounts(signal_rest_get("/v1/accounts")))
+        new_accounts = current_set - before_set
+        if new_accounts:
+            print(f"✅ Device linked! New account(s): {', '.join(sorted(new_accounts))}")
+            return
 
     print("⚠️ Linking timed out (no new account detected). Please try again.", file=sys.stderr)
 
@@ -843,7 +924,7 @@ def main():
             "  %(prog)s --list-signal\n"
             "  %(prog)s --link-signal --name 'my-automation'\n"
             "\n"
-            "CSV columns: method, recipient, name, message, account, service, file, delay\n"
+            "CSV columns: method, recipient, name, message, account, service, file, voice, delay\n"
             "The 'name' field is printed in the status output during CSV sends.\n"
             "For SMS rows the 'service' column must be 'sms' or 'imessage'.\n"
             f"Signal REST API: {SIGNAL_REST_URL}\n"
@@ -873,7 +954,8 @@ def main():
     # Signal-specific
     signal_grp = parser.add_argument_group("Signal options")
     signal_grp.add_argument("--account", metavar="PHONE", help="Signal account phone number to use")
-    signal_grp.add_argument("--recipients", metavar="RECIPIENTS", help="Send to Signal group ID (no --to needed)")
+    signal_grp.add_argument("--recipients", nargs="+", metavar="RECIPIENT",
+                            help="Send to one or more Signal group IDs / recipients (no --to needed)")
     signal_grp.add_argument("--voice", metavar="AUDIO", help="Send an audio file as a Signal voice message")
     signal_grp.add_argument("--name", metavar="NAME", help="Device name for Signal linking (default: 'automation')")
 
@@ -895,6 +977,8 @@ def main():
     csv_grp.add_argument("--dry-run", action="store_true", help="Preview a CSV batch without sending")
     csv_grp.add_argument("--yes", "-y", action="store_true",
                          help="Skip the large-batch confirmation prompt")
+    csv_grp.add_argument("--json", action="store_true", dest="json_output",
+                         help="Emit a machine-readable JSON summary (for unattended runs)")
 
     args = parser.parse_args()
 
