@@ -3,29 +3,31 @@
 sendmsg — Universal message sender for Signal and SMS/iMessage.
 
 Usage:
-  sendmsg --signal --to +18005551212 --text "Hello from Signal!"
-  sendmsg --signal --recipients group_id_here --text "All members"
-  sendmsg --sms   --to +18005551212 --text "Hello via SMS!"
-  sendmsg --sms   --to +18005551212 --text "Hey" --file ~/photo.png
-  sendmsg --signal --to +18005551212 --text "Multi" --text "more text"
-  sendmsg --signal --to +18005551212 --attach ~/doc.pdf ~/pic.jpg
-  sendmsg --csv messages.csv                  # Bulk send from CSV file
-  sendmsg --csv messages.csv --delay 2        # Wait N seconds between sends
-  sendmsg --list-signal       # Show linked Signal accounts
-  sendmsg --link-signal        # Link a new device to your existing Signal account
+    sendmsg --signal --to +18005551212 --text "Hello from Signal!"
+    sendmsg --signal --recipients group_id_here --text "All members"
+    sendmsg --sms --to +18005551212 --text "Hello via SMS!"
+    sendmsg --sms --to +18005551212 --text "Hey" --file ~/photo.png
+    sendmsg --signal --to +18005551212 --text "Multi" --text "more text"
+    sendmsg --signal --to +18005551212 --attach ~/doc.pdf ~/pic.jpg
+    sendmsg --csv messages.csv             # Bulk send from CSV file
+    sendmsg --csv messages.csv --delay 2   # Wait N seconds between sends
+    sendmsg --list-signal                  # Show linked Signal accounts
+    sendmsg --link-signal                  # Link a new device to your existing Signal account
 
 CSV format (messages.csv):
-  method,recipient,name,message,account,service,file,delay
-  signal,+1888222333,Alice,Hello via Signal,+1888222333,,,
-  signal,group.ZzBHd3NZO...,Group alert,,,,-1
-  sms,+123****7890,Bob,SMS test,,,~/pic.jpg,
-  signal,+1888222333,Carol,With delay,,,-3
+    method,recipient,name,message,account,service,file,delay
+    signal,+1888222333,Alice,Hello via Signal,+1888222333,,,
+    signal,group.ZzBHd3NZO...,Group alert,Hi team,,,,
+    sms,+1234567890,Bob,SMS test,,,~/pic.jpg,
+    signal,+1888222333,Carol,With delay,,,,3
 """
 
 import argparse
+import base64
 import configparser
 import csv
 import json
+import mimetypes
 import os
 import subprocess
 import sys
@@ -34,7 +36,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "4.0.0"
+VERSION = "4.3.0"
+
 CONFIG_PATHS = [
     os.path.expanduser("~/.sendmsg.conf"),
 ]
@@ -54,23 +57,36 @@ def load_config():
         "signal_rest_url": "http://localhost:8080",
         "signal_default_account": "+1234567890",
     }
-    config = configparser.ConfigParser()
+    env_vars = {
+        "signal_rest_url": "SIGNAL_REST_URL",
+        "signal_default_account": "SIGNAL_ACCOUNT",
+    }
 
+    config = configparser.ConfigParser()
+    config_path = None
     for path in CONFIG_PATHS:
         if os.path.isfile(path):
             config.read(path)
+            config_path = path
             break
 
-    return {
-        "signal_rest_url": (
-            os.environ.get("SIGNAL_REST_URL")
-            or config.get("settings", "signal_rest_url", fallback=defaults["signal_rest_url"])
-        ),
-        "signal_default_account": (
-            os.environ.get("SIGNAL_ACCOUNT")
-            or config.get("settings", "signal_default_account", fallback=defaults["signal_default_account"])
-        ),
-    }
+    resolved = {}
+    sources = {}
+    for key, default in defaults.items():
+        env_val = os.environ.get(env_vars[key])
+        if env_val:
+            resolved[key] = env_val
+            sources[key] = f"env (${env_vars[key]})"
+        elif config.has_option("settings", key):
+            resolved[key] = config.get("settings", key)
+            sources[key] = f"config ({config_path})"
+        else:
+            resolved[key] = default
+            sources[key] = "default"
+
+    resolved["_sources"] = sources
+    resolved["_config_path"] = config_path
+    return resolved
 
 
 # Load config at module level for use by all functions
@@ -83,23 +99,87 @@ SIGNAL_DEFAULT_ACCOUNT = CFG["signal_default_account"]
 # Helpers — reusable without argparse objects (needed for CSV dispatch)
 # ---------------------------------------------------------------------------
 
+def expand_path(path):
+    """Expand '~' and environment variables in a file path.
+
+    CSV rows supply literal paths like '~/pic.jpg'; unlike the shell, Python
+    does not expand the tilde, so os.path.isfile('~/pic.jpg') is always False.
+    This caused CSV Signal attachments to be silently dropped.
+    """
+    if not path:
+        return path
+    return os.path.expanduser(os.path.expandvars(path.strip()))
+
+
+def normalize_account(account):
+    """Ensure an account/phone number carries a leading '+'.
+
+    Group IDs (starting with 'group.') are returned unchanged.
+    """
+    if not account:
+        return account
+    account = account.strip()
+    if account.startswith("group."):
+        return account
+    if not account.startswith("+"):
+        account = "+" + account
+    return account
+
+
+def is_group_id(value):
+    """Return True if a recipient value looks like a Signal group ID.
+
+    signal-cli group IDs are either the 'group.<base64>' form used by the
+    REST API, or a raw base64 internal group key. Sending a group message
+    down the 1:1 'recipient' path is what causes the 'Unregistered user
+    <uuid>' errors and the wrong-sender appearance in issue #3, so we treat
+    anything that is not a phone number as a group ID.
+    """
+    if not value:
+        return False
+    value = value.strip()
+    if value.startswith("group."):
+        return True
+    # Phone numbers start with '+' followed by digits. Anything else that
+    # is not a phone number is assumed to be a (raw) group ID.
+    if value.startswith("+") and value[1:].isdigit():
+        return False
+    return True
+
+
 def send_one_signal(account, recipient, message, group_id=None, attach=None):
     """Send a single Signal message. Returns True on success."""
-    payload = {"number": account}
+    account = normalize_account(account)
 
+    payload = {"number": account}
     if group_id:
         payload["recipients"] = [group_id]
     else:
-        payload["recipient"] = recipient
+        payload["recipients"] = [recipient]
 
     if message:
         payload["message"] = message
 
-    # Attachments
-    if attach and os.path.isfile(attach):
+    # Expand '~' / env vars; CSV supplies literal paths the shell never saw.
+    attach = expand_path(attach) if attach else None
+
+    # If an attachment was specified but does not exist, warn loudly rather
+    # than silently sending text-only.
+    if attach and not os.path.isfile(attach):
+        print(f"⚠️ Warning: attachment not found, sending without it: {attach}", file=sys.stderr)
+        attach = None
+
+    has_attachment = bool(attach)
+    if not message and not has_attachment:
+        print(
+            f"❌ Signal send skipped: no message text and no valid attachment "
+            f"(recipient: {group_id or recipient})",
+            file=sys.stderr,
+        )
+        return False
+
+    if has_attachment:
         result = signal_rest_post("/v2/send", payload=payload, files=[attach])
-    elif message and not group_id:
-        result = signal_rest_post("/v2/send", payload=payload)
     else:
         result = signal_rest_post("/v2/send", payload=payload)
 
@@ -109,17 +189,17 @@ def send_one_signal(account, recipient, message, group_id=None, attach=None):
 def send_one_sms(to, message, service=None, file=None):
     """Send a single SMS/iMessage. Returns True on success."""
     cmd = ["imsg", "send", "--to", to]
-
     if service:
         cmd.extend(["--service", service])
-
     cmd.extend(["--text", message])
-
-    if file and os.path.isfile(file):
-        cmd.extend(["--file", file])
+    if file:
+        file = expand_path(file)
+        if os.path.isfile(file):
+            cmd.extend(["--file", file])
+        else:
+            print(f"⚠️ Warning: file not found, skipping attachment: {file}", file=sys.stderr)
 
     result = subprocess.run(cmd, capture_output=True, text=True)
-
     if result.returncode == 0:
         service_label = service.upper() if service else "AUTO"
         print(f"✅ SMS/iMessage sent to {to} (service: {service_label})")
@@ -134,54 +214,42 @@ def send_one_sms(to, message, service=None, file=None):
 # ---------------------------------------------------------------------------
 
 def signal_rest_post(endpoint, payload=None, files=None):
-    """Post JSON or multipart form data to the signal-cli-rest-api.
+    """Post a JSON request to the signal-cli-rest-api.
+
+    The /v2/send endpoint expects a single JSON body. Attachments are NOT
+    sent as multipart/form-data — they must be base64-encoded and placed in
+    the "base64_attachments" array, each as a data URI of the form
+    'data:<mime>;filename=<name>;base64,<data>'. Sending multipart produces
+    HTTP 400 "invalid request".
 
     Returns the parsed JSON response dict, or None on failure.
     """
     url = f"{SIGNAL_REST_URL.rstrip('/')}{endpoint}"
 
-    if files is not None and files:
-        # Multipart form data for attachments
-        boundary = "----sendmsg-boundary"
-        body_parts = []
+    payload = dict(payload) if payload else {}
 
-        if payload:
-            for key, value in payload.items():
-                body_parts.append(
-                    f"--{boundary}\r\n"
-                    f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
-                    f"{value}\r\n"
-                )
-
+    if files:
+        b64_attachments = []
         for fpath in files:
+            fpath = expand_path(fpath)
             if not os.path.isfile(fpath):
-                print(f"⚠️  Warning: attachment not found: {fpath}", file=sys.stderr)
+                print(f"⚠️ Warning: attachment not found: {fpath}", file=sys.stderr)
                 continue
             with open(fpath, "rb") as fh:
-                content = fh.read()
+                encoded = base64.b64encode(fh.read()).decode("ascii")
             fname = os.path.basename(fpath)
-            body_parts.append(
-                f"--{boundary}\r\n"
-                f"Content-Disposition: form-data; name=\"attachment\"; filename=\"{fname}\"\r\n"
-                f"Content-Type: application/octet-stream\r\n\r\n"
-            )
-            body_parts.append(content)
-            body_parts.append(b"\r\n")
+            mime = mimetypes.guess_type(fpath)[0] or "application/octet-stream"
+            # Data-URI form preserves both MIME type and filename.
+            b64_attachments.append(f"data:{mime};filename={fname};base64,{encoded}")
 
-        body_parts.append(f"--{boundary}--\r\n".encode("utf-8"))
-        full_body = b"".join(body_parts)
+        if b64_attachments:
+            payload["base64_attachments"] = b64_attachments
 
-        headers = {
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        }
-    else:
-        # JSON payload
-        body = json.dumps(payload).encode("utf-8") if payload else b"{}"
-        headers = {"Content-Type": "application/json"}
-        full_body = body
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    full_body = body
 
     req = urllib.request.Request(url, data=full_body, headers=headers, method="POST")
-
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             resp_data = resp.read().decode("utf-8")
@@ -194,7 +262,7 @@ def signal_rest_post(endpoint, payload=None, files=None):
                     )
                     return None
                 return result
-            return None
+            return {}
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         print(
@@ -236,59 +304,58 @@ def cmd_signal(args):
     if not args.to and not args.recipients:
         print("❌ Error: --to <phone> is required for direct messages, or use --recipients for groups.", file=sys.stderr)
         sys.exit(1)
-    if not args.text and not getattr(args, "attach", None) and not args.recipients:
+
+    attach_files = getattr(args, "attach", None) or getattr(args, "file", None)
+
+    # Text or an attachment is required in ALL cases, including group sends.
+    if not args.text and not attach_files:
         print("❌ Error: --text <message> or --attach <file> is required.", file=sys.stderr)
         sys.exit(1)
 
-    account = args.account or SIGNAL_DEFAULT_ACCOUNT
-    if not account.startswith("+"):
-        account = "+" + account
+    account = normalize_account(args.account or SIGNAL_DEFAULT_ACCOUNT)
 
     # Build the JSON payload for /v2/send
     payload = {"number": account}
-
     if args.recipients:
-        # Send to a Signal group — use recipients array with group. prefix
+        # Send to a Signal group — use recipients array with the group ID.
         payload["recipients"] = [args.recipients]
     else:
-        # Send to individual recipients (string)
-        payload["recipient"] = args.to[0]
+        # Send to an individual recipient. The REST API accepts a
+        # recipients array for direct messages too; using it consistently
+        # avoids the 1:1-vs-group dispatch mismatch behind issue #3.
+        payload["recipients"] = [args.to[0]]
 
     # Message text (join multiple --text args)
     if args.text:
         payload["message"] = "\n".join(args.text)
 
     # Attachments
-    attach_files = getattr(args, "attach", None)
-
     if attach_files and len(attach_files) > 0:
         if len(attach_files) == 1:
-            # Single file — send as multipart with message
+            # Single file — send as multipart with the message.
             result = signal_rest_post("/v2/send", payload=payload, files=attach_files)
         else:
-            # Multiple files: send message first, then each attachment separately
+            # Multiple files: send the text first, then each attachment.
             multi_payload = {"number": account, "message": payload.get("message", "")}
-            if args.recipients:
-                multi_payload["recipients"] = [args.recipients]
-            else:
-                multi_payload["recipient"] = args.to[0]
-            result = signal_rest_post("/v2/send", payload=multi_payload)
-            if result is None:
-                sys.exit(1)
-            # Then send each attachment
-            for fpath in attach_files:
-                att_payload = {"number": account}
-                if args.recipients:
-                    att_payload["recipients"] = [args.recipients]
-                else:
-                    att_payload["recipient"] = args.to[0]
-                result = signal_rest_post("/v2/send", payload=att_payload, files=[fpath])
+            multi_payload["recipients"] = payload["recipients"]
+
+            # Only send a standalone text message if there is actual text.
+            result = None
+            if multi_payload["message"]:
+                result = signal_rest_post("/v2/send", payload=multi_payload)
                 if result is None:
-                    print(f"⚠️  Attachment failed: {fpath}", file=sys.stderr)
-    elif args.text and not args.recipients:
-        result = signal_rest_post("/v2/send", payload=payload)
+                    sys.exit(1)
+
+            # Then send each attachment.
+            for fpath in attach_files:
+                att_payload = {"number": account, "recipients": payload["recipients"]}
+                att_result = signal_rest_post("/v2/send", payload=att_payload, files=[fpath])
+                if att_result is None:
+                    print(f"⚠️ Attachment failed: {fpath}", file=sys.stderr)
+                else:
+                    result = att_result
     else:
-        # Group message or other case
+        # Text-only send (direct or group).
         result = signal_rest_post("/v2/send", payload=payload)
 
     if result is not None:
@@ -298,8 +365,7 @@ def cmd_signal(args):
             print(f"✅ Signal message sent to {args.to[0]}")
         else:
             print("✅ Signal message sent")
-        if args.verbose and result:
-            # Print any extra details from the API response
+        if args.verbose and isinstance(result, dict):
             for key, value in result.items():
                 if key not in ("success",):
                     print(f"   {key}: {value}")
@@ -318,21 +384,21 @@ def cmd_sms(args):
         sys.exit(1)
 
     cmd = ["imsg", "send", "--to", args.to[0]]
-
     if args.service:
         cmd.extend(["--service", args.service])
-
     msg_text = "\n".join(args.text)
     cmd.extend(["--text", msg_text])
 
-    if getattr(args, "file", None):
-        for f in args.file:
+    attach_files = getattr(args, "file", None) or getattr(args, "attach", None)
+    if attach_files:
+        for f in attach_files:
+            f = expand_path(f)
             if not os.path.isfile(f):
-                print(f"⚠️  Warning: file not found: {f}", file=sys.stderr)
+                print(f"⚠️ Warning: file not found, skipping: {f}", file=sys.stderr)
+                continue
             cmd.extend(["--file", f])
 
     result = subprocess.run(cmd, capture_output=True, text=True)
-
     if result.returncode == 0:
         service_label = args.service.upper() if args.service else "AUTO"
         print(f"✅ SMS/iMessage sent to {args.to[0]} (service: {service_label})")
@@ -340,21 +406,23 @@ def cmd_sms(args):
         print(f"❌ SMS send failed (exit {result.returncode})", file=sys.stderr)
         if result.stderr:
             print(f"   {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_csv(args):
     """Bulk send messages from a CSV file.
 
     Expected CSV columns:
-      method, recipient, name, message, account, service, file, delay
+        method, recipient, name, message, account, service, file, delay
     """
     filepath = args.csv
-
     if not os.path.isfile(filepath):
         print(f"❌ Error: file not found: {filepath}", file=sys.stderr)
         sys.exit(1)
 
-    delay = float(args.delay) if args.delay else 0.0
+    # Global delay from --delay applies between every send unless a row
+    # specifies its own delay (which takes precedence).
+    global_delay = float(args.delay) if args.delay else 0.0
 
     with open(filepath, newline="", encoding="utf-8") as csvfile:
         reader = csv.DictReader(csvfile)
@@ -376,20 +444,20 @@ def cmd_csv(args):
         name = row.get("name", "").strip()
 
         # Skip blank rows
-        if not method and not message:
+        if not method and not message and not to:
             continue
 
         if not method:
             method = "signal"  # default
 
         if method not in ("signal", "sms"):
-            print(f"⚠️  Row {i}: unknown method '{method}' — skipping", file=sys.stderr)
+            print(f"⚠️ Row {i}: unknown method '{method}' — skipping", file=sys.stderr)
             failed += 1
             errors.append(f"Row {i}: unknown method '{method}'")
             continue
 
         if not message:
-            print(f"⚠️  Row {i}: empty message — skipping", file=sys.stderr)
+            print(f"⚠️ Row {i}: empty message — skipping", file=sys.stderr)
             failed += 1
             errors.append(f"Row {i}: empty message")
             continue
@@ -398,14 +466,21 @@ def cmd_csv(args):
         account = row.get("account", "").strip() or SIGNAL_DEFAULT_ACCOUNT
         service = row.get("service", "").strip() or None
         file_path = row.get("file", "").strip() or None
-        delay_str = row.get("delay", "0").strip()
-        row_delay = float(delay_str) if delay_str else 0.0
+        delay_str = row.get("delay", "").strip()
+        try:
+            row_delay = float(delay_str) if delay_str else None
+        except ValueError:
+            print(f"⚠️ Row {i}: invalid delay '{delay_str}' — ignoring", file=sys.stderr)
+            row_delay = None
 
         label = f"{name} ({to})" if name else to or "(group)"
         print(f"[{i}/{total}] {method.upper()} → {label}")
 
         if method == "signal":
-            group_id = to if to.startswith("group.") else None
+            # Detect groups robustly (issue #3): raw base64 group IDs do NOT
+            # start with 'group.' and were previously sent down the 1:1
+            # recipient path, producing 'Unregistered user <uuid>' errors.
+            group_id = to if is_group_id(to) else None
             result = send_one_signal(
                 account=account,
                 recipient=to,
@@ -413,21 +488,13 @@ def cmd_csv(args):
                 group_id=group_id,
                 attach=file_path,
             )
-        elif method == "sms":
+        else:  # sms
             result = send_one_sms(
                 to=to,
                 message=message,
                 service=service,
                 file=file_path,
             )
-            if result:
-                success += 1
-            else:
-                failed += 1
-                errors.append(f"Row {i}: SMS failed")
-            if row_delay > 0:
-                time.sleep(row_delay)
-            continue
 
         if result:
             success += 1
@@ -435,9 +502,10 @@ def cmd_csv(args):
             failed += 1
             errors.append(f"Row {i}: failed to send")
 
-        # Delay between sends (only if explicitly set in row)
-        if row_delay > 0:
-            time.sleep(row_delay)
+        # Per-row delay overrides global; otherwise use the global --delay.
+        effective_delay = row_delay if row_delay is not None else global_delay
+        if effective_delay > 0:
+            time.sleep(effective_delay)
 
     # Summary
     print()
@@ -456,6 +524,46 @@ def cmd_csv(args):
 
     if failed > 0:
         sys.exit(1)
+
+
+def cmd_show_config(args):
+    """Report the resolved configuration and where each value came from."""
+    sources = CFG.get("_sources", {})
+    config_path = CFG.get("_config_path")
+
+    print("=" * 50)
+    print("⚙️  sendmsg configuration")
+    print("=" * 50)
+    print(f"  Version:        {VERSION}")
+    print()
+
+    if config_path:
+        print(f"  Config file:    {config_path} (found)")
+    else:
+        searched = ", ".join(CONFIG_PATHS)
+        print(f"  Config file:    none found (searched: {searched})")
+    print()
+
+    print(f"  signal_rest_url:        {SIGNAL_REST_URL}")
+    print(f"    └─ source:            {sources.get('signal_rest_url', 'unknown')}")
+    print()
+    print(f"  signal_default_account: {SIGNAL_DEFAULT_ACCOUNT}")
+    print(f"    └─ source:            {sources.get('signal_default_account', 'unknown')}")
+    print()
+
+    print("  Resolution order: env var > config file > built-in default")
+    print("=" * 50)
+
+    # Optionally probe whether the Signal REST API is reachable.
+    if getattr(args, "verbose", False):
+        print()
+        print("  Checking Signal REST API reachability...")
+        result = signal_rest_get("/v1/accounts")
+        if result is None:
+            print(f"  ❌ Not reachable at {SIGNAL_REST_URL}")
+        else:
+            print(f"  ✅ Reachable at {SIGNAL_REST_URL}")
+        print("=" * 50)
 
 
 def cmd_list_signal(args):
@@ -491,18 +599,19 @@ def cmd_link_signal(args):
     name = args.name or "automation"
     payload = {"name": name}
     result = signal_rest_post("/v1/link", payload=payload)
-
     if result is None:
         print("❌ Failed to initiate device linking.", file=sys.stderr)
         sys.exit(1)
 
-    sgnl_url = result.get("url", result.get("linkUrl", ""))
+    sgnl_url = ""
+    if isinstance(result, dict):
+        sgnl_url = result.get("url", result.get("linkUrl", ""))
     if not sgnl_url:
         print("❌ No sgnl:// URL returned. API response:", file=sys.stderr)
         print(json.dumps(result, indent=2), file=sys.stderr)
         sys.exit(1)
 
-    print(f"🔗 Scan this QR code or visit this URL to link your device:")
+    print("🔗 Scan this QR code or visit this URL to link your device:")
     print(f"   {sgnl_url}")
     print()
     print("Waiting for confirmation (Ctrl+C to cancel)...")
@@ -515,7 +624,7 @@ def cmd_link_signal(args):
             print(f"✅ Device linked! Account: {result}")
             return
 
-    print("⚠️  Linking timed out. Please try again.", file=sys.stderr)
+    print("⚠️ Linking timed out. Please try again.", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -530,8 +639,8 @@ def main():
             "Examples:\n"
             "  %(prog)s --signal --to +18005551212 --text 'Hello!'\n"
             "  %(prog)s --signal --recipients GROUP_ID --text 'Hello group!'\n"
-            "  %(prog)s --sms   --to +18005551212 --text 'Text via SMS'\n"
-            "  %(prog)s --sms   --to +18005551212 --text 'Hey' --file ~/pic.jpg\n"
+            "  %(prog)s --sms --to +18005551212 --text 'Text via SMS'\n"
+            "  %(prog)s --sms --to +18005551212 --text 'Hey' --file ~/pic.jpg\n"
             "  %(prog)s --csv messages.csv\n"
             "  %(prog)s --csv messages.csv --delay 2\n"
             "  %(prog)s --list-signal\n"
@@ -551,7 +660,7 @@ def main():
 
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {VERSION}")
 
-    # Method (mutually exclusive)
+    # Method
     method = parser.add_argument_group("Messaging method (choose one)")
     method.add_argument("--signal", action="store_true", help="Send via Signal")
     method.add_argument("--sms", action="store_true", help="Send via SMS/iMessage (macOS Messages)")
@@ -560,20 +669,22 @@ def main():
     # Common options
     parser.add_argument("--to", nargs="+", metavar="PHONE", help="Recipient phone number(s)")
     parser.add_argument("--text", nargs="+", metavar="MSG", help="Message text (repeat for multiple)")
-    parser.add_argument("--file", "--attach", nargs="+", metavar="PATH", help="Attachment file path(s)")
+    parser.add_argument("--file", "--attach", nargs="+", metavar="PATH", dest="file",
+                        help="Attachment file path(s)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
     # Signal-specific
     signal_grp = parser.add_argument_group("Signal options")
     signal_grp.add_argument("--account", metavar="PHONE", help="Signal account phone number to use")
     signal_grp.add_argument("--recipients", metavar="RECIPIENTS", help="Send to Signal group ID (no --to needed)")
-    signal_grp.add_argument("--voice", action="store_true", help="Send as voice note (Signal only)")
+    signal_grp.add_argument("--name", metavar="NAME", help="Device name for Signal linking (default: 'automation')")
 
     # Management commands
     mgmt = parser.add_argument_group("Management commands")
     mgmt.add_argument("--list-signal", action="store_true", help="List linked Signal accounts")
     mgmt.add_argument("--link-signal", action="store_true", help="Link a new device to your Signal account")
-    signal_grp.add_argument("--name", metavar="NAME", help="Device name for Signal linking (default: 'automation')")
+    mgmt.add_argument("--show-config", action="store_true",
+                      help="Print resolved configuration and where each value came from")
 
     # SMS-specific
     sms_grp = parser.add_argument_group("SMS/iMessage options")
@@ -585,14 +696,17 @@ def main():
 
     args = parser.parse_args()
 
+    # cmd_signal still reads args.attach in places; keep an alias.
+    args.attach = args.file
+
     # Validate: must have a method or management command
-    if not any([args.signal, args.sms, args.csv, args.list_signal, args.link_signal]):
+    if not any([args.signal, args.sms, args.csv, args.list_signal, args.link_signal, args.show_config]):
         parser.print_help()
-        print("\n❌ Error: Specify --signal, --sms, --csv, --list-signal, or --link-signal", file=sys.stderr)
+        print("\n❌ Error: Specify --signal, --sms, --csv, --list-signal, --link-signal, or --show-config", file=sys.stderr)
         sys.exit(1)
 
-    if sum([args.signal, args.sms]) > 1:
-        print("❌ Error: Choose only one method (--signal or --sms).", file=sys.stderr)
+    if sum([bool(args.signal), bool(args.sms), bool(args.csv)]) > 1:
+        print("❌ Error: Choose only one method (--signal, --sms, or --csv).", file=sys.stderr)
         sys.exit(1)
 
     # Set defaults
@@ -610,6 +724,8 @@ def main():
         cmd_list_signal(args)
     elif args.link_signal:
         cmd_link_signal(args)
+    elif args.show_config:
+        cmd_show_config(args)
 
 
 if __name__ == "__main__":
