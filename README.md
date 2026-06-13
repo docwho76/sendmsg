@@ -96,7 +96,18 @@ It supports individual direct messages, Signal group broadcasts, file attachment
 
 ## Installation
 
-1. **Get signal-cli-rest running in docker compose:**
+1. **Place the script:**
+
+```
+cp sendmsg /usr/local/bin/sendmsg
+chmod +x /usr/local/bin/sendmsg
+```
+
+2. **Ensure dependencies are installed:**
+
+   **For Signal:**
+
+   a. **Get signal-cli-rest running in docker compose:**
    Put the following config into your docker-compose.yml file (this assumes you are using [traefik](https://github.com/traefik/traefik) to reverse proxy your docker compose services and [pullio](https://hotio.dev/scripts/pullio/) to automate updates)
 
 ```
@@ -123,25 +134,15 @@ services:
       - PGID=$GROUP_ID
       - TZ=$TIMEZONE_NAME
 ```
-$SIGNAL_INTERNAL_URL - The internal URL traefik will server the container from https://example.internal.mydomain.com
-$WEBHOOK_URL - The URL to your IFTTT webhook for Pullio, i.e https://maker.ifttt.com/trigger/Pullio/with/key/test-key
-$GRAVATAR_URL - The URL for your [Gravatar](https://gravatar.com/) icon i.e https://s.gravatar.com/avatar/1234567890
-$NAME - The name you give to this service in traefik
-$PATH_TO_DOCKER_STORAGE_DIR - The directory on your docker compose host where the signal containers filesystem lives i.e /opt/docker-data/signal
-$TIMEZONE_NAME - i.e "America/Los_Angeles"
+    $SIGNAL_INTERNAL_URL - The internal URL traefik will server the container from https://example.internal.mydomain.com
+    $WEBHOOK_URL - The URL to your IFTTT webhook for Pullio, i.e https://maker.ifttt.com/trigger/Pullio/with/key/test-key
+    $GRAVATAR_URL - The URL for your [Gravatar](https://gravatar.com/) icon i.e https://s.gravatar.com/avatar/1234567890
+    $NAME - The name you give to this service in traefik
+    $PATH_TO_DOCKER_STORAGE_DIR - The directory on your docker compose host where the signal containers filesystem lives i.e /opt/docker-data/signal
+    $TIMEZONE_NAME - The [Linux Timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) name i.e "America/Los_Angeles"
 
-Note: See https://builder.aws.com/content/2tmBo5uCgpwQegRBsdSDmupj5rH/lets-encrypt-dns01-challenge-with-traefik-and-aws-route-53 for examples of using AWS Route53 with traefik to do Lets Encrypt ACME DNS-01 requests for automatic SSL certificate creation with Traefik. Installation of traefik is outside the scope of this document.
+    Note: See https://builder.aws.com/content/2tmBo5uCgpwQegRBsdSDmupj5rH/lets-encrypt-dns01-challenge-with-traefik-and-aws-route-53 for examples of using AWS Route53 with traefik to do Lets Encrypt ACME DNS-01 requests for automatic SSL certificate creation with Traefik. Installation of traefik is outside the scope of this document.
 
-2. **Place the script:**
-
-```
-cp sendmsg /usr/local/bin/sendmsg
-chmod +x /usr/local/bin/sendmsg
-```
-
-2. **Ensure dependencies are installed:**
-
-   **For Signal:**
 
 ```
 # Verify signal-cli-rest-api is running
