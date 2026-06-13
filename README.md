@@ -126,7 +126,7 @@ services:
       - "org.hotio.pullio.generic.webhook=$WEBHOOK_URL"
       - "org.hotio.pullio.author.avatar=$GRAVATAR_URL"
     volumes:
-      - $PATH_TO_DOCKER_STORAGE_DIR:/home/.local/share/signal-cli
+      - $DOCKER_STORAGE_DIR:/home/.local/share/signal-cli
     environment:
       - MODE=native
       - AUTO_RECEIVE_SCHEDULE=0 22 * * *
@@ -135,24 +135,24 @@ services:
       - TZ=$TIMEZONE_NAME
 ```
 
-  $SIGNAL_INTERNAL_URL - The internal URL traefik will server the container from https://example.internal.mydomain.com
-  $WEBHOOK_URL - The URL to your IFTTT webhook for Pullio, i.e https://maker.ifttt.com/trigger/Pullio/with/key/test-key
-  $GRAVATAR_URL - The URL for your [Gravatar](https://gravatar.com/) icon i.e https://s.gravatar.com/avatar/1234567890
-  $NAME - The name you give to this service in traefik
-  $PATH_TO_DOCKER_STORAGE_DIR - The directory on your docker compose host where the signal containers filesystem lives i.e /opt/docker-data/signal
-  $TIMEZONE_NAME - The [Linux Timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) name i.e "America/Los_Angeles"
+- _$SIGNAL_INTERNAL_URL_ - The internal URL traefik will server the container from https://example.internal.mydomain.com
+- _$WEBHOOK_URL_ - The URL to your IFTTT webhook for Pullio, i.e https://maker.ifttt.com/trigger/Pullio/with/key/test-key
+- _$GRAVATAR_URL_ - The URL for your [Gravatar](https://gravatar.com/) icon i.e https://s.gravatar.com/avatar/1234567890
+- _$NAME_ - The name you give to this service in traefik
+- _$DOCKER_STORAGE_DIR_ - The directory on your docker compose host where the signal containers filesystem lives i.e /opt/docker-data/signal
+- _$TIMEZONE_NAME_ - The [Linux Timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) name i.e "America/Los_Angeles"
 
-  Note: See https://builder.aws.com/content/2tmBo5uCgpwQegRBsdSDmupj5rH/lets-encrypt-dns01-challenge-with-traefik-and-aws-route-53 for examples of using AWS Route53 with traefik to do Lets Encrypt ACME DNS-01 requests for automatic SSL certificate creation with Traefik. Installation of traefik is outside the scope of this document.
+<sub>**Note:** See https://builder.aws.com/content/2tmBo5uCgpwQegRBsdSDmupj5rH/lets-encrypt-dns01-challenge-with-traefik-and-aws-route-53 for examples of using AWS Route53 with traefik to do Lets Encrypt ACME DNS-01 requests for automatic SSL certificate creation with Traefik. Installation of traefik is outside the scope of this document.</sub>
 
+  b. **Verify signal-cli-rest-api is running**
 ```
-# Verify signal-cli-rest-api is running
 curl -s http://localhost:8080/v1/accounts | python3 -m json.tool
 ```
 
    **For SMS/iMessage:**
 
+  Verify imsg is installed and available
 ```
-# Verify imsg is installed and available
 imsg send --help
 ```
 
