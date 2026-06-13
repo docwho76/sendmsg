@@ -2,6 +2,11 @@
 
 All notable changes to `sendmsg` are documented here.
 
+## 5.1.1
+
+### Added
+- **Updated README.md:** Exposes docker compose sample config for signal-rest-api setup along with notes on Traefik and Pullio usage and integration
+
 ## 5.1.0
 
 ### Added
