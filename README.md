@@ -55,7 +55,7 @@ It supports individual direct messages, Signal group broadcasts, file attachment
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Signal path:** `sendmsg` → JSON HTTP POST → `signal-cli-rest-api` → Docker container → Signal network. Attachments are base64-encoded inline in the JSON request body (the API does not accept multipart uploads). Voice messages are sent the same way with the API's `voice` flag set so they render as playable voice notes.
+**Signal path:** `sendmsg` → JSON HTTP POST → `signal-cli-rest-api` → Docker container → Signal network. Attachments are base64-encoded inline in the JSON request body (the API does not accept multipart uploads). Voice messages are sent the same way, as an audio attachment in a message of its own — the REST API has no dedicated voice-note flag, so how the audio renders (inline player vs. file) is up to the receiving client.
 
 **SMS/iMessage path:** `sendmsg` → subprocess call → `imsg` CLI → macOS Messages framework → carrier/Apple.
 
@@ -177,6 +177,7 @@ Messaging methods (choose one):
 
 Management commands (choose one):
   --list-signal         List linked Signal accounts
+  --list-groups         List Signal groups and their IDs (use --account to pick the account)
   --link-signal         Link a new device to your Signal account
   --show-config         Print resolved configuration and where each value came from
 ```
@@ -210,8 +211,10 @@ sendmsg --signal --to +18885551212 --attach ~/report.pdf
 
 ### Voice Messages
 
-Send an audio file as a Signal **voice note** (a playable voice message,
-not a file attachment) with `--voice`:
+Send an audio file as a Signal **voice message** with `--voice`. The audio is
+delivered as an audio attachment in its own message (the Signal REST API has
+no dedicated voice-note field, so whether it renders as an inline playable
+voice note or as an audio file depends on the recipient's client):
 
 ```
 # Send a voice message
@@ -267,6 +270,10 @@ sendmsg --csv messages.csv --yes        # Skip the large-batch confirmation
 # List linked Signal accounts
 sendmsg --list-signal
 
+# List Signal groups and their IDs (for --recipients and CSV rows)
+sendmsg --list-groups
+sendmsg --list-groups --account +18885551212
+
 # Link a new device
 sendmsg --link-signal
 sendmsg --link-signal --name "my-laptop"
@@ -291,11 +298,12 @@ Create a CSV file with the following columns:
 | `account`   | No       | Signal account phone number (defaults to `$SIGNAL_ACCOUNT` / config value)           |
 | `service`   | Varies   | SMS service: `imessage` or `sms`. **Required** on `sms` rows; ignored for `signal`.  |
 | `file`      | No       | Path to an attachment file. `~` and environment variables are expanded.              |
-| `voice`     | No       | Path to an audio file to send as a Signal **voice note**. Signal only.               |
+| `voice`     | No       | Path to an audio file to send as a Signal **voice message**. Signal only.                       |
 | `delay`     | No       | Seconds to wait after this row is sent (overrides the global `--delay`).             |
 
 **Notes**
 
+- **Commas in the message are fine.** The standard way is to quote the field: `signal,+1888,Alice,"Hi, how are you?",,,,,`. If a message contains *unquoted* commas, `sendmsg` detects that the row has more fields than the header, merges the extra fragments back into the `message` column (keeping the columns before and after it intact), and prints a warning suggesting quoting. Fields that themselves contain quotes follow normal CSV rules (`"She said ""hi"", then left"`).
 - `signal` rows may be **attachment-only** or **voice-only**: if a `file` or `voice` is present, the `message` may be left blank. `sms` rows always require a `message`.
 - The `voice` column is **Signal only**. An `sms` row with a `voice` value is skipped and reported, since SMS/iMessage has no voice-note concept.
 - A voice note is sent as its own message; if a row has both `voice` and `file`, they are delivered as separate messages.
@@ -486,6 +494,17 @@ After processing all rows, a summary is printed:
 > machine-readable summary in unattended runs.
 
 ---
+
+## Testing
+
+The repository ships with a pytest suite (`tests/test_sendmsg.py`) that runs entirely offline — no Signal container, no macOS, and no real config needed:
+
+```bash
+pip install pytest
+python3 -m pytest tests/
+```
+
+See [TESTING.md](TESTING.md) for details on selecting subsets of tests, how the suite stubs out sends, and how CI runs it.
 
 ## Changelog
 
