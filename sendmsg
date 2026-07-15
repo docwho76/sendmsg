@@ -9,11 +9,12 @@ Usage:
     sendmsg --sms --to +18005551212 --text "Hey" --service imessage --file ~/photo.png
     sendmsg --signal --to +18005551212 --text "Multi" --text "more text"
     sendmsg --signal --to +18005551212 --attach ~/doc.pdf ~/pic.jpg
-    sendmsg --signal --to +18005551212 --voice ~/note.m4a   # Send a voice message
+    sendmsg --signal --to +18005551212 --voice ~/note.m4a   # Send an audio/voice message
     sendmsg --csv messages.csv             # Bulk send from CSV file
     sendmsg --csv messages.csv --delay 2   # Wait N seconds between sends
     sendmsg --csv messages.csv --dry-run   # Preview without sending
     sendmsg --list-signal                  # Show linked Signal accounts
+    sendmsg --list-groups                  # Show Signal groups and their IDs
     sendmsg --link-signal                  # Link a new device to your existing Signal account
 
 CSV format (messages.csv):
@@ -39,7 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "5.1.1"
+VERSION = "5.2.0"
 
 CONFIG_PATHS = [
     os.path.expanduser("~/.sendmsg.conf"),
@@ -137,9 +138,23 @@ def expand_path(path):
     return os.path.expanduser(os.path.expandvars(path.strip()))
 
 
+# Characters commonly used to format phone numbers. These must be stripped
+# before phone-vs-group detection: '+1 (800) 555-1212' is a phone number, but
+# without stripping it fails the all-digits test and is mis-routed as a
+# Signal group ID (the same class of bug as issue #3).
+_PHONE_FORMAT_CHARS = str.maketrans("", "", " \t-.()")
+
+
+def strip_phone_separators(value):
+    """Remove spaces, dashes, dots, and parentheses from a phone number."""
+    return value.translate(_PHONE_FORMAT_CHARS)
+
+
 def normalize_account(account):
     """Ensure an account/phone number carries a leading '+'.
 
+    Formatting characters (spaces, dashes, dots, parentheses) are stripped
+    so the number is in the E.164-ish form the Signal REST API expects.
     Group IDs (starting with 'group.') are returned unchanged.
     """
     if not account:
@@ -147,6 +162,7 @@ def normalize_account(account):
     account = account.strip()
     if account.startswith("group."):
         return account
+    account = strip_phone_separators(account)
     if not account.startswith("+"):
         account = "+" + account
     return account
@@ -155,17 +171,20 @@ def normalize_account(account):
 def looks_like_phone_number(value):
     """Return True if value looks like a phone number.
 
-    Accepts numbers with an explicit '+', and also bare all-digit strings
-    (which a user may type without the leading '+'). This is the inverse
-    test used by is_group_id, and the two must agree on what a bare number
-    is so a phone number is never mis-routed as a group.
+    Accepts numbers with an explicit '+', bare all-digit strings, and
+    numbers containing common formatting characters ('+1 (800) 555-1212',
+    '555-867-5309'). This is the inverse test used by is_group_id, and the
+    two must agree on what a phone number is so a number is never
+    mis-routed as a group.
     """
     if not value:
         return False
-    value = value.strip()
+    value = strip_phone_separators(value.strip())
+    if not value:
+        return False
     if value.startswith("+"):
         return value[1:].isdigit() and len(value) > 1
-    # A bare run of digits (optionally long) is a phone number, not a group.
+    # A bare run of digits is a phone number, not a group.
     return value.isdigit()
 
 
@@ -285,12 +304,16 @@ def send_one_signal(account, recipient, message, group_id=None,
         )
         return False
 
-    # A voice note is sent as its own message (a voice note cannot be mixed
-    # with arbitrary file attachments in a single send).
+    # A voice message is sent as its own message, separate from any other
+    # file attachments. NOTE: signal-cli-rest-api's /v2/send has no
+    # voice-note field (a previous release sent "voice": true, which the
+    # API silently ignored), so the audio is delivered as a regular audio
+    # attachment. How it renders (inline player vs. file) is up to the
+    # receiving client.
     overall_ok = True
 
     if has_voice:
-        voice_payload = {"number": account, "recipients": [target], "voice": True}
+        voice_payload = {"number": account, "recipients": [target]}
         if message and not has_attachment:
             # Attach the text to the voice message if there are no other files.
             voice_payload["message"] = message
@@ -361,15 +384,9 @@ def send_one_sms(to, message, service, file=None):
             print(f"✅ SMS/iMessage sent to {to} (service: {service.upper()})")
             return True
 
-        if attempt < max_attempts:
-            wait = backoff * attempt
-            print(
-                f"⚠️ SMS send to {to} failed (exit {result.returncode}); retrying in "
-                f"{wait:.0f}s (attempt {attempt}/{max_attempts})...",
-                file=sys.stderr,
-            )
-            time.sleep(wait)
-            continue
+        # A non-zero exit is almost always permanent (bad recipient, Messages
+        # not signed in, etc.); retrying just burns time. Only timeouts —
+        # a hung Messages app — are treated as transient and retried above.
         print(f"❌ SMS send failed (exit {result.returncode}): {result.stderr.strip()}", file=sys.stderr)
         return False
 
@@ -466,22 +483,48 @@ def signal_rest_post(endpoint, payload=None, files=None):
 
 
 def signal_rest_get(endpoint):
-    """GET a JSON response from the signal-cli-rest-api."""
+    """GET a JSON response from the signal-cli-rest-api.
+
+    Transient failures (429/5xx, network errors) are retried with backoff,
+    matching the resilience of the POST helper.
+    """
     url = f"{SIGNAL_REST_URL.rstrip('/')}{endpoint}"
-    req = urllib.request.Request(url, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = resp.read().decode("utf-8")
-            if data.strip():
-                return json.loads(data)
+    max_attempts = 3
+    backoff = 2.0
+    for attempt in range(1, max_attempts + 1):
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = resp.read().decode("utf-8")
+                if data.strip():
+                    return json.loads(data)
+                return None
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            if e.code in (429, 500, 502, 503, 504) and attempt < max_attempts:
+                wait = backoff * attempt
+                print(
+                    f"⚠️ Signal REST HTTP {e.code}; retrying in {wait:.0f}s "
+                    f"(attempt {attempt}/{max_attempts})...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            print(f"❌ Signal REST error: HTTP {e.code} — {body[:500]}", file=sys.stderr)
             return None
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        print(f"❌ Signal REST error: HTTP {e.code} — {body[:500]}", file=sys.stderr)
-        return None
-    except urllib.error.URLError as e:
-        print(f"❌ Cannot reach Signal REST API at {SIGNAL_REST_URL}: {e.reason}", file=sys.stderr)
-        return None
+        except urllib.error.URLError as e:
+            if attempt < max_attempts:
+                wait = backoff * attempt
+                print(
+                    f"⚠️ Cannot reach Signal REST API ({e.reason}); retrying in "
+                    f"{wait:.0f}s (attempt {attempt}/{max_attempts})...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            print(f"❌ Cannot reach Signal REST API at {SIGNAL_REST_URL}: {e.reason}", file=sys.stderr)
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -568,13 +611,18 @@ def cmd_sms(args):
             else:
                 print(f"⚠️ Warning: SMS supports one attachment; ignoring extra file: {ef}", file=sys.stderr)
 
-    ok = send_one_sms(
-        to=args.to[0],
-        message=msg_text,
-        service=args.service,
-        file=chosen_file,
-    )
-    if not ok:
+    # Fan out to every --to recipient, matching the Signal path. Previously
+    # only args.to[0] was sent and extra recipients were silently dropped.
+    all_ok = True
+    for to in args.to:
+        ok = send_one_sms(
+            to=normalize_account(to),
+            message=msg_text,
+            service=args.service,
+            file=chosen_file,
+        )
+        all_ok = all_ok and ok
+    if not all_ok:
         sys.exit(1)
 
 
@@ -591,28 +639,83 @@ def cmd_csv(args):
 
     # Global delay from --delay applies between every send unless a row
     # specifies its own delay (which takes precedence).
-    global_delay = float(args.delay) if args.delay else 0.0
+    global_delay = args.delay if args.delay else 0.0
 
-    with open(filepath, newline="", encoding="utf-8") as csvfile:
-        reader = csv.DictReader(csvfile)
+    # With --json the summary on stdout must be the ONLY stdout output so it
+    # can be piped to a parser; per-row progress then goes to stderr.
+    progress = sys.stderr if getattr(args, "json_output", False) else sys.stdout
+
+    # 'utf-8-sig' transparently strips a UTF-8 BOM. Excel and many editors
+    # write one; under plain 'utf-8' it corrupts the first header to
+    # '\ufeffmethod', making every row's method look empty — which then
+    # defaulted to 'signal' and silently misrouted explicit 'sms' rows.
+    # restkey collects overflow fields (see repair below); restval="" fills
+    # missing trailing columns so short rows never produce None values.
+    with open(filepath, newline="", encoding="utf-8-sig") as csvfile:
+        reader = csv.DictReader(csvfile, restkey="_overflow", restval="")
+        fieldnames = reader.fieldnames or []
         rows = list(reader)
 
     if not rows:
         print("❌ Error: CSV file is empty (no data rows).", file=sys.stderr)
         sys.exit(1)
 
-    # Count the rows that will actually be attempted (non-blank).
-    actionable = [
-        r for r in rows
-        if (r.get("method", "").strip()
-            or r.get("message", "").strip()
-            or r.get("recipient", "").strip()
-            or r.get("file", "").strip()
-            or r.get("voice", "").strip())
-    ]
+    def repair_overflow(row):
+        """Merge unquoted-comma overflow back into the message field.
+
+        Standard CSV quoting ('"Hi, there"') is fully supported and needs no
+        repair. But a message containing UNQUOTED commas splits into extra
+        fields, shifting every column after 'message' (so part of the text
+        lands in 'account', the delay in 'voice', etc.) and corrupting the
+        row silently. When a row has more fields than the header, the only
+        sane interpretation is that the extras belong to the free-text
+        message column: keep the columns before 'message' from the front,
+        the columns after it from the back, and rejoin everything in the
+        middle with commas.
+
+        Returns (row, n_extra_fields_merged).
+        """
+        overflow = row.pop("_overflow", None)
+        if not overflow or "message" not in fieldnames:
+            return row, 0
+        idx = fieldnames.index("message")
+        n_after = len(fieldnames) - idx - 1
+        raw = [str(row.get(h) or "") for h in fieldnames] + [str(x) for x in overflow]
+        merged = ",".join(raw[idx:len(raw) - n_after])
+        repaired = dict(zip(fieldnames, raw[:idx] + [merged] + raw[len(raw) - n_after:]))
+        return repaired, len(overflow)
+
+    repair_notes = []
+    for idx0, row in enumerate(rows):
+        repaired, n_extra = repair_overflow(row)
+        if n_extra:
+            rows[idx0] = repaired
+            note = (
+                f"Row {idx0 + 1}: message contains unquoted commas; merged "
+                f"{n_extra} extra field(s) back into the message. Quote the "
+                f'field ("...") to silence this.'
+            )
+            repair_notes.append(note)
+            print(f"⚠️ {note}", file=sys.stderr)
+
+    def row_is_blank(r):
+        """True if a row has no content in any actionable column.
+
+        Used both for the pre-flight count and the per-row skip so the two
+        can never disagree (previously a row with only a 'file' value was
+        counted as actionable but then silently skipped as blank).
+        """
+        return not any(
+            (r.get(col) or "").strip()
+            for col in ("method", "recipient", "message", "file", "voice")
+        )
+
+    actionable = [r for r in rows if not row_is_blank(r)]
+    blank = len(rows) - len(actionable)
 
     if args.dry_run:
-        print(f"🔎 Dry run: {len(actionable)} row(s) would be processed from {filepath}\n")
+        print(f"🔎 Dry run: {len(actionable)} row(s) would be processed from {filepath}\n",
+              file=progress)
     elif len(actionable) > CSV_CONFIRM_THRESHOLD and not args.yes:
         try:
             resp = input(
@@ -629,17 +732,17 @@ def cmd_csv(args):
     failed = 0
     skipped = 0
     previewed = 0
-    errors = []
+    errors = list(repair_notes)
 
     for i, row in enumerate(rows, 1):
-        method = row.get("method", "").strip().lower()
-        message = row.get("message", "").strip()
-        to = row.get("recipient", "").strip()
-        name = row.get("name", "").strip()
-        voice_path = row.get("voice", "").strip() or None
+        method = (row.get("method") or "").strip().lower()
+        message = (row.get("message") or "").strip()
+        to = (row.get("recipient") or "").strip()
+        name = (row.get("name") or "").strip()
+        voice_path = (row.get("voice") or "").strip() or None
 
-        # Skip blank rows
-        if not method and not message and not to and not voice_path:
+        # Skip blank rows (same test as the pre-flight count above).
+        if row_is_blank(row):
             continue
 
         if not method:
@@ -661,6 +764,16 @@ def cmd_csv(args):
         except ValueError:
             print(f"⚠️ Row {i}: invalid delay '{delay_str}' — ignoring", file=sys.stderr)
             row_delay = None
+
+        # A recipient is always required. Previously a recipient-less signal
+        # row was passed through and POSTed with an empty recipients entry,
+        # producing a confusing API error (and a dry run reported it as
+        # sendable).
+        if not to:
+            print(f"⚠️ Row {i}: missing recipient — skipping", file=sys.stderr)
+            skipped += 1
+            errors.append(f"Row {i}: missing recipient")
+            continue
 
         # A message is required UNLESS there is an attachment or a voice note
         # (Signal can send attachment-only / voice-only messages). SMS still
@@ -698,21 +811,32 @@ def cmd_csv(args):
 
         label = f"{name} ({to})" if name else to or "(group)"
         prefix = "[DRY] " if args.dry_run else ""
-        print(f"{prefix}[{i}/{total}] {method.upper()} → {label}")
+        print(f"{prefix}[{i}/{total}] {method.upper()} → {label}", file=progress)
 
         if args.dry_run:
-            # Report what would happen without sending.
+            # Report what would happen without sending, and validate the
+            # attachment paths so problems surface BEFORE a real run.
             extras = []
             if file_path:
-                extras.append(f"file={file_path}")
+                expanded = expand_path(file_path)
+                if os.path.isfile(expanded):
+                    extras.append(f"file={file_path}")
+                else:
+                    extras.append(f"file={file_path} [NOT FOUND]")
+                    errors.append(f"Row {i}: attachment not found: {expanded}")
             if voice_path:
-                extras.append(f"voice={voice_path}")
+                expanded = expand_path(voice_path)
+                if os.path.isfile(expanded):
+                    extras.append(f"voice={voice_path}")
+                else:
+                    extras.append(f"voice={voice_path} [NOT FOUND]")
+                    errors.append(f"Row {i}: voice file not found: {expanded}")
             if method == "signal" and is_group_id(to):
                 extras.append("group")
             if method == "sms":
                 extras.append(f"service={service}")
             if extras:
-                print(f"        ({', '.join(extras)})")
+                print(f"        ({', '.join(extras)})", file=progress)
             previewed += 1
             continue
 
@@ -752,6 +876,7 @@ def cmd_csv(args):
     if getattr(args, "json_output", False):
         summary = {
             "total": total,
+            "blank": blank,
             "success": success,
             "skipped": skipped,
             "failed": failed,
@@ -767,6 +892,8 @@ def cmd_csv(args):
         print("📊 CSV Send Summary" + (" (DRY RUN)" if args.dry_run else ""))
         print("=" * 50)
         print(f"  Total rows:   {total}")
+        if blank:
+            print(f"  ⬜ Blank:      {blank}")
         if args.dry_run:
             print(f"  🔎 Would send: {previewed}")
         else:
@@ -901,6 +1028,51 @@ def cmd_link_signal(args):
             return
 
     print("⚠️ Linking timed out (no new account detected). Please try again.", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_list_groups(args):
+    """List the Signal groups the account belongs to, with their IDs.
+
+    Uses GET /v1/groups/{number}. This is the sanctioned way to discover the
+    group IDs that CSV rows and --recipients expect.
+    """
+    account = normalize_account(args.account or SIGNAL_DEFAULT_ACCOUNT)
+    if account == PLACEHOLDER_ACCOUNT:
+        print(
+            f"❌ Error: no Signal account configured (still the placeholder "
+            f"{PLACEHOLDER_ACCOUNT}). Set SIGNAL_ACCOUNT, set "
+            f"signal_default_account in ~/.sendmsg.conf, or pass --account.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    endpoint = f"/v1/groups/{urllib.parse.quote(account, safe='')}"
+    result = signal_rest_get(endpoint)
+    if result is None:
+        print(f"❌ Failed to list groups for {account}.", file=sys.stderr)
+        sys.exit(1)
+
+    # Shape-tolerant: expect a list of group dicts, but don't crash on
+    # variations. Known keys across API versions: name, id ('group.<b64>'),
+    # internal_id, members, blocked.
+    groups = result if isinstance(result, list) else result.get("groups", []) if isinstance(result, dict) else []
+    if not groups:
+        print(f"No Signal groups found for {account}.")
+        return
+
+    print(f"Signal groups for {account}:")
+    for g in groups:
+        if not isinstance(g, dict):
+            print(f"  • {g}")
+            continue
+        gname = g.get("name") or "(unnamed)"
+        gid = g.get("id") or g.get("internal_id") or "(no id)"
+        members = g.get("members")
+        member_note = f", {len(members)} member(s)" if isinstance(members, list) else ""
+        blocked_note = " [blocked]" if g.get("blocked") else ""
+        print(f"  • {gname}{blocked_note}{member_note}")
+        print(f"      id: {gid}")
 
 
 # ---------------------------------------------------------------------------
@@ -922,6 +1094,7 @@ def main():
             "  %(prog)s --csv messages.csv --delay 2\n"
             "  %(prog)s --csv messages.csv --dry-run\n"
             "  %(prog)s --list-signal\n"
+            "  %(prog)s --list-groups\n"
             "  %(prog)s --link-signal --name 'my-automation'\n"
             "\n"
             "CSV columns: method, recipient, name, message, account, service, file, voice, delay\n"
@@ -962,6 +1135,8 @@ def main():
     # Management commands
     mgmt = parser.add_argument_group("Management commands")
     mgmt.add_argument("--list-signal", action="store_true", help="List linked Signal accounts")
+    mgmt.add_argument("--list-groups", action="store_true",
+                      help="List Signal groups (and their IDs) for the account")
     mgmt.add_argument("--link-signal", action="store_true", help="Link a new device to your Signal account")
     mgmt.add_argument("--show-config", action="store_true",
                       help="Print resolved configuration and where each value came from")
@@ -973,7 +1148,8 @@ def main():
 
     # CSV-specific
     csv_grp = parser.add_argument_group("CSV options")
-    csv_grp.add_argument("--delay", metavar="SECONDS", help="Wait N seconds between CSV row sends (default: 0)")
+    csv_grp.add_argument("--delay", metavar="SECONDS", type=float,
+                         help="Wait N seconds between CSV row sends (default: 0)")
     csv_grp.add_argument("--dry-run", action="store_true", help="Preview a CSV batch without sending")
     csv_grp.add_argument("--yes", "-y", action="store_true",
                          help="Skip the large-batch confirmation prompt")
@@ -991,6 +1167,7 @@ def main():
         "--sms": args.sms,
         "--csv": bool(args.csv),
         "--list-signal": args.list_signal,
+        "--list-groups": args.list_groups,
         "--link-signal": args.link_signal,
         "--show-config": args.show_config,
     }
@@ -998,7 +1175,7 @@ def main():
 
     if not chosen:
         parser.print_help()
-        print("\n❌ Error: Specify --signal, --sms, --csv, --list-signal, --link-signal, or --show-config", file=sys.stderr)
+        print("\n❌ Error: Specify --signal, --sms, --csv, --list-signal, --list-groups, --link-signal, or --show-config", file=sys.stderr)
         sys.exit(1)
 
     if len(chosen) > 1:
@@ -1023,6 +1200,8 @@ def main():
         cmd_csv(args)
     elif args.list_signal:
         cmd_list_signal(args)
+    elif args.list_groups:
+        cmd_list_groups(args)
     elif args.link_signal:
         cmd_link_signal(args)
     elif args.show_config:

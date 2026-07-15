@@ -2,6 +2,27 @@
 
 All notable changes to `sendmsg` are documented here.
 
+## 5.2.0
+
+### Added
+- **`--list-groups`:** Lists the Signal groups the account belongs to, with their names, IDs, member counts, and blocked status (via `GET /v1/groups/{number}`). This is the sanctioned way to discover the group IDs that `--recipients` and CSV rows expect. Errors out clearly when no real account is configured.
+- **Test suite and CI:** A pytest suite (`tests/`) covering phone/group detection, path expansion, attachment validation, Signal payload construction, CSV dispatch (BOM, blank rows, skips, dry run, `--json`), and CLI argument validation, plus a GitHub Actions workflow running it on Python 3.10–3.13.
+- **Commas in CSV messages:** Quoted message fields (`"Hi, there"`) are parsed per standard CSV rules as before, and messages with *unquoted* commas are now repaired automatically — the extra fragments are merged back into the `message` column (columns before and after it are preserved) with a warning recommending quoting. Previously an unquoted comma silently shifted every subsequent column, leaking message text into `account`, `service`, etc. Rows with fewer fields than the header are also tolerated (missing trailing columns are treated as empty).
+- **Dry-run validation:** `--dry-run` now flags rows with missing recipients and verifies that `file`/`voice` paths exist (reported as `[NOT FOUND]` and listed in the summary notes), so problems surface before a real run.
+
+### Fixed
+- **Voice messages: removed the non-existent `voice` API flag.** signal-cli-rest-api's `/v2/send` has no voice-note field; the flag sent since 5.0.0 was silently ignored and the audio was always delivered as a regular audio attachment. The payload and documentation now reflect reality. (`--voice` still works — the audio is sent as its own message — but whether it renders as a playable voice note depends on the receiving client.)
+- **UTF-8 BOM no longer misroutes CSV rows.** CSVs are read with `utf-8-sig`. Previously a BOM (written by Excel and many editors) corrupted the first header to `\ufeffmethod`, making every row's method appear empty — which defaulted to `signal` and silently sent explicit `sms` rows via Signal.
+- **Formatted phone numbers are no longer misdetected as group IDs.** Spaces, dashes, dots, and parentheses are stripped before phone-vs-group detection and before sending, so `+1 (800) 555-1212` and `555-867-5309` are routed as direct messages in E.164 form instead of down the group path.
+- **`--delay abc` no longer crashes.** The global `--delay` is parsed by argparse as a float, producing a clean usage error instead of a `ValueError` traceback.
+- **`--json` output is machine-parseable.** Per-row progress lines now go to stderr when `--json` is set, so stdout contains only the JSON summary and can be piped to `jq` etc. The summary also gains a `blank` count.
+- **`--sms` sends to every `--to` recipient.** Previously only the first was sent and the rest were silently dropped; the SMS path now fans out like the Signal path and recipients are `+`-normalized.
+- **Rows without a recipient are skipped and reported** instead of being POSTed with an empty recipient and failing with a confusing API error.
+- **CSV summary accounting is exact.** Blank rows are counted and reported (`blank` in `--json`, a `Blank` line in the text summary), and the blank/actionable test is shared between the pre-flight count and the row loop, so a row containing only a `file` value can no longer be counted as actionable yet silently skipped. `Total = blank + success + skipped + failed` always holds.
+- **SMS retries only on timeout.** Non-zero `imsg` exits (bad recipient, Messages not signed in, ...) are permanent and now fail fast instead of being retried three times with backoff.
+- **`--link-signal` timeout exits non-zero**, so scripts can detect a failed link.
+- **`--list-signal` and other GET calls now retry** transient failures (429/5xx, network errors) with backoff, matching the send path.
+
 ## 5.1.1
 
 ### Added
